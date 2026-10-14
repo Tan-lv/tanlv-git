@@ -1,0 +1,41 @@
+# ===== 数据集与训练产物 (太大, 不进 Git) =====
+# 图片数据集 2.24 GB、模型权重 1 GB, 留在本地磁盘
+dataset/
+runs/
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ===== PyCharm / 编辑器 =====
+.idea/
+.vscode/
+
+# ===== 模型与数据文件兜底 =====
+*.pt
+*.pth
+*.onnx
+*.ckpt
+*.safetensors
+*.h5
+*.pb
+*.zip
+*.7z
+*.rar
+*.mp4
+*.avi
+
+# ===== 脚本备份 / 临时文件 =====
+*.bak
+*.bak_*
+*.bak-*
+*.tmp
+*.log
+*.orig
+
+# ===== 系统 =====
+Thumbs.db
+Desktop.ini
+.DS_Store
