@@ -1,0 +1,28 @@
+{
+  "name": "cs01",
+  "created_at": "2026-10-15 15:35:14",
+  "updated_at": "2026-10-15 17:41:51",
+  "note": "横屏第一版：1280x720 中间竖窗。2026-10-15 从 gamer_ai/dataset + gamer_ai/runs 归位到档案",
+  "game_res": [
+    1905,
+    1072
+  ],
+  "crop_rel": [
+    0.181102,
+    0.0,
+    0.490814,
+    0.671642
+  ],
+  "calibrated_at": "2026-10-15 13:23:08",
+  "renamed_from": "横屏主线",
+  "renamed_at": "2026-10-15 15:47:18",
+  "game": "subway_surfers",
+  "keys": {
+    "n": "N",
+    "w": "W",
+    "s": "S",
+    "a": "A",
+    "d": "D",
+    "q": "Q"
+  }
+}
