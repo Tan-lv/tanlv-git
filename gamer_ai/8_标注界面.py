@@ -531,9 +531,14 @@ def main():
         _iter = os.path.join(_model_dir, "迭代数据")
         print("[模型] %s" % _model_dir)
     else:
-        _iter = (os.path.join(_P.dataset_root(_prof) if _prof else os.path.join(HERE, "dataset"),
-                              "迭代数据"))
-        print("[模型] 没找到模型目录：迭代数据放在档案 dataset\\迭代数据\\ 下")
+        # ★ 2026-10-15：迭代数据现在**跟着模型走**（runs/<模型>/迭代数据/）。
+        #   这里以前会退回档案的 dataset\迭代数据\ 并建出空会话 —— 结果训练时多出一个
+        #   "0 个样本"的会话（还得靠训练端过滤），纯属噪音。现在直接说清楚：先去训练一个模型。
+        raise SystemExit(
+            "[模型] 这个档案里还没有模型 —— 迭代数据是跟着模型走的，先训一个：\n"
+            "       python 4_训练.py %s\n"
+            "       然后再跑本界面标注（产物会进 runs/<模型>/迭代数据/）"
+            % (("--profile " + _prof) if _prof else ""))
     if ARGS.events is None:
         ARGS.events = os.path.join(_iter, "原始事件")
     if ARGS.session is None:

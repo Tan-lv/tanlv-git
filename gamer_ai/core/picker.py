@@ -396,6 +396,11 @@ def commit_choice(rel, game_rect, full_shape, ask: bool = True, profile: str = N
     gx, gy, gw, gh = [int(v) for v in game_rect]
     ch, cw = int(full_shape[0]), int(full_shape[1])
     crop = crop_from_rel(gw, gh, rel)
+    # ★ 2026-10-16：存档案时**一律记吸附后的框**（rel_from_crop(crop)），而不是你鼠标拖的
+    #   原始框。以前如果拖的不是 240:293（或按了 l 解锁比例），档案里就会记下那个"宽框"，
+    #   而真正生效的是吸附后的窄框 —— 档案和实际采的数据对不上，看着就像"我框的没生效"。
+    from .geometry import rel_from_crop as _rel_from_crop
+    rel = _rel_from_crop(gw, gh, crop)
     geo = make_geometry(rel, (gw, gh), game_crop=crop, offset=(gx, gy),
                         client=(cw, ch), note=note or "自检弹窗鼠标拉框选出来的区域")
 

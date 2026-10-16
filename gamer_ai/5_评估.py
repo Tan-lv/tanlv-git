@@ -90,8 +90,8 @@ def load_cfg(sessions, args) -> Config:
             valid = {fl.name for fl in fields(Config)}
             for k, v in raw.items():
                 if k in valid:
-                    if k in ("game_res", "game_crop", "labels", "animation_neg_end_ms",
-                              "approach_neg_end_ms"):
+                    if v is not None and k in ("game_res", "game_crop", "labels", "crop_rel",
+                                               "animation_neg_end_ms", "approach_neg_end_ms"):
                         v = tuple(v)
                     setattr(cfg, k, v)
             break
@@ -151,6 +151,30 @@ def measure_latency(model, device, in_frames, img_size, n=60):
     return dt * 1000.0
 
 
+def run_auto_cam(args) -> None:
+    """评估结束自动出"每类抽样"注意力热力图（默认开，--no-cam 关）。
+
+    ★ 2026-10-16：以前这段直接写在 main() 末尾，结果"模型没有 N 类"那条早退分支
+      会先 return，热力图就不生成了（用户："热力图片怎么没有生成"）。抽成函数后
+      两条路径都调用它。
+    """
+    if not getattr(args, "cam_auto", True) or getattr(args, "cam", False):
+        return
+    try:
+        from core import attention_report as _AR
+        _adir = os.path.join(args.run, "模型评估", "attention")
+        print("\n[注意力] 自动出「每类抽样」热力图（每类一张最自信的样本 -> 拼成一张）…")
+        print("         想跳过加 --no-cam；想自己挑样本用 --cam --ids …")
+        _rc = _AR.main(["--run", args.run, "--sessions", *list(args.sessions),
+                        "--out", _adir])
+        if _rc:
+            print("[注意力] 出图失败（返回码 %s），不影响上面的评估结果" % _rc)
+    except SystemExit as _e:
+        print("[注意力] 跳过：%s" % _e)
+    except Exception as _e:
+        print("[注意力] 出图出错（不影响评估结果）：%s" % _e)
+
+
 def main():
     ap = argparse.ArgumentParser(description="本地评估：模型效果诊断")
     ap.add_argument("--run", default=None,
@@ -186,7 +210,9 @@ def main():
     ap.add_argument("--val-ratio", type=float, default=0.15)
     ap.add_argument("--test-ratio", type=float, default=0.15)
     ap.add_argument("--segment-seconds", type=float, default=15.0)
-    ap.add_argument("--split-mode", default="time_balanced")
+    ap.add_argument("--split-mode", default="by_session",
+                    help="划分方式：by_session（默认，按会话/局整段划分，最诚实）、"
+                         "time_balanced（会话内按时间段分，val 会虚高）、time_block、random")
     ap.add_argument("--boundary-gap", type=int, default=5)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--no-anim-neg", action="store_true")
@@ -383,14 +409,51 @@ def main():
     for i, l in enumerate(labels):
         print(f"  {l:<5} " + "".join(f"{cm[i, j]:>7d}" for j in range(len(labels))))
 
-    # ---------- 真实样本 vs 换道动画负样本 ----------
+    m_real = kinds == "real"
+    m_neg = kinds == "anim_neg"
+    m_app = kinds == "approach_neg"
+    # ★ 2026-10-16：模型可能**没有 N 类**（N 样本太少被 min-train-samples 当稀有类剔除了）。
+    #   以前这里直接 labels.index("N") 会 ValueError 崩掉；而且没有 N 时，两类合成负样本
+    #   根本不会被生成（core/dataset.py 里 "N" not in labels -> return []），
+    #   所以"N 相关指标"没有任何意义 —— 打印一份说明，把能给的数字给完就收工。
+    if "N" not in labels:
+        print()
+        print("=" * 78)
+        print("[警告] 这个模型**没有 N 类**（'别动'）")
+        print("=" * 78)
+        print("  原因：训练时 N 样本太少（< --min-train-samples，默认 10），被当稀有类剔除了。")
+        print("  连带后果：两类合成 N 负样本也一个都不会生成（core/dataset.py：")
+        print("            'N' not in labels -> 负样本生成器直接返回空）。")
+        print("  实际影响：模型对每一帧都**必须**输出 A/D/S/W 里的一个 —— 学不会'别动'，")
+        print("            换道动画里会重复触发、障碍还远就乱动，只能靠部署端锁定硬压。")
+        print("  怎么办：补采 n（正常玩时每 1~2 秒按一下，或用 2_采集.py 的 F9 自动补 N）到 100+ 后重训；")
+        print("          只做验证可以加 --min-train-samples 0 把 N 保留进来（9 个样本权重会爆，别上线）。")
+        print("  因此：『该换道却输出 N』『换道动画负样本』『障碍还远负样本』这几项无法评估，已跳过。")
+        print("=" * 78)
+        # 延迟这里单独算一次（正常的计算在后面那段，这里提前返回了）
+        lat = measure_latency(model, device, in_frames, args.img_size)
+        print("单张推理延迟 %.1f ms  ->  理论上限 %.0f fps   (6_自动玩.py 需要 >= 40fps)"
+              % (lat, 1000.0 / max(lat, 1e-6)))
+        _ed = os.path.join(args.run, "模型评估")
+        os.makedirs(_ed, exist_ok=True)
+        json.dump({"run": os.path.abspath(args.run), "split": args.split,
+                   "n_real": int(m_real.sum()), "accuracy": acc, "macro_f1": macro_f1,
+                   "real_acc": (float((y_pred[m_real] == y_true[m_real]).mean())
+                                if m_real.any() else None),
+                   "danger_rate": None, "no_N": True,
+                   "per_class": rows, "confusion": cm.tolist(), "labels": labels,
+                   "latency_ms": lat},
+                  open(os.path.join(_ed, f"eval_{args.split}.json"), "w", encoding="utf-8"),
+                  ensure_ascii=False, indent=2)
+        print()
+        print("[输出] %s" % os.path.join(_ed, f"eval_{args.split}.json"))
+        run_auto_cam(args)        # ★ 没有 N 类也要出热力图（默认就出）
+        return 0
+
     print()
     print("=" * 78)
     print("关键指标：两类合成负样本上的表现")
     print("=" * 78)
-    m_real = kinds == "real"
-    m_neg = kinds == "anim_neg"
-    m_app = kinds == "approach_neg"
     n_idx = labels.index("N")
 
     if m_real.any():
@@ -480,25 +543,8 @@ def main():
     json.dump(out, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
     print(f"\n[输出] {p}")
 
-    # ---------- ★ 2026-10-15（用户要求）：评估结束自动出"每类抽样"注意力热力图 ----------
-    #   以前必须手动加 --cam 才有图，于是"评估完怎么没有热力图"。
-    #   现在默认就出：每个类别挑一张**最自信且预测正确**的样本，画 Grad-CAM，
-    #   最后 6 张纵向拼成一张 attention_grid.png（在 <模型>/模型评估/attention/）。
-    #   跳过的办法：--no-cam。想自己指定样本：--cam --ids A_000322 …
-    if getattr(args, "cam_auto", True) and not args.cam:
-        try:
-            from core import attention_report as _AR
-            _adir = os.path.join(args.run, "模型评估", "attention")
-            print("\n[注意力] 自动出「每类抽样」热力图（每类一张最自信的样本 -> 拼成一张）…")
-            print("         想跳过加 --no-cam；想自己挑样本用 --cam --ids …")
-            _rc = _AR.main(["--run", args.run, "--sessions", *list(args.sessions),
-                            "--out", _adir])
-            if _rc:
-                print("[注意力] 出图失败（返回码 %s），不影响上面的评估结果" % _rc)
-        except SystemExit as _e:
-            print("[注意力] 跳过：%s" % _e)
-        except Exception as _e:
-            print("[注意力] 出图出错（不影响评估结果）：%s" % _e)
+    # ★ 评估结束自动出"每类抽样"热力图（默认开；--no-cam 关）—— 见 run_auto_cam()
+    run_auto_cam(args)
     return 0
 
 

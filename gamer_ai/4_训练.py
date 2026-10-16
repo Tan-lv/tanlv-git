@@ -84,7 +84,7 @@ GAME = "subway_surfers"
 #  改完直接 Run，不用记命令行参数。
 # ==============================================================================
 TRAIN = {
-    "epochs": 60,              # 训练轮数（一轮约 1.5~4 分钟，看数据量；早停会自动提前结束）
+    "epochs": 300,              # 训练轮数（一轮约 1.5~4 分钟，看数据量；早停会自动提前结束）
     "batch_size": 32,          # 批大小（显存不够就调小，比如 16）
     "lr": 1e-3,                # 学习率
     "weight_decay": 1e-3,      # 权重衰减（防过拟合）
@@ -92,12 +92,19 @@ TRAIN = {
     # ---- 类别不平衡：地铁跑酷踩过的坑就在这儿 ----
     "class_weight_max": 5.0,   # 类别权重上限。0 = 不截断（曾把稀有类权重放大到 218，模型练崩）
     "min_train_samples": 10,   # 训练集里少于这么多个样本的类别直接不参与训练（剔除稀有类）
+    # ---- 合成 N 负样本的占比（★ 自动按比例封顶）----
+    #   负样本 = 从每个按键样本的胶片条里合成的"换道动画中 / 障碍还远"，标签是 N。
+    #   它们会随数据集线性膨胀（上次占到训练条目的 71%），太多会：训练变慢 + 模型变怂。
+    #   0.5 = 负样本最多是正样本的一半（N 占训练集 ≤ 33%）
+    #   1.0 = 负样本 ≤ 正样本（N ≤ 50%，默认）
+    #   0   = 不限（不推荐）
+    "neg_ratio": 0.3,
     # ---- 数据来源权重（新旧数据混着练时用）----
     #   写法："20261011_204728=1.0,迭代数据=2.0"   键 = 会话名/路径片段，值 = 权重
     "source_weight": None,
     # ---- 挑最优 / 早停 ----
     "select_metric": "macro_f1",   # 用哪个指标挑 best.pt：macro_f1 或 acc
-    "patience": 15,                # 连续多少轮没提升就停
+    "patience": 20,                # 连续多少轮没提升就停
     # 下面这个一般不用改
     "img_size": 224,
 }
@@ -167,16 +174,35 @@ def main() -> int:
                          "模型默认也存到该档案的 runs/ 下。不给就用当前档案")
     ap.add_argument("--dry-run", action="store_true",
                     help="只打印这次会用到哪些会话、输出到哪，不真的开始训练")
-    ap.add_argument("path", nargs="?", default=None,
-                    help="★ 直接传路径就行：区域档案目录（含 profile.json）/ 档案名 / 会话目录。"
-                         "给了它就不用再记 --profile、--session。不给就用当前区域档案")
+    ap.add_argument("--path", dest="path_hint", default=None,
+                    help="也可以用它指定：区域档案目录（含 profile.json）/ 档案名 / 会话目录；"
+                         "不给就用当前区域档案")
     args, rest = ap.parse_known_args()
 
     # ★ 2026-10-15 区域档案：--profile 给定时，数据固定用这个档案的 dataset/，
     #   模型默认也落到这个档案的 runs/ 下 —— 一块区域的数据和模型配套放在一起。
     from core import profiles as P
     #   位置参数 path：档案目录 / 档案名 / 会话目录，三种都能吃
-    _path = getattr(args, "path", None)
+    # ★ 2026-10-16：原来用位置参数 nargs="?" 收路径，结果 "--epochs 1" 里的 "1"
+    #   会被 argparse 当成路径（未知选项的值被位置参数吃掉）→ 报"看不懂这个路径：1"。
+    #   现在两条路：① --path xxx 显式给；② 自己扫 argv，只认**真的存在**的档案目录/档案名/会话目录。
+    _path = getattr(args, "path_hint", None)
+    if _path is None:
+        for _a in list(rest):
+            if _a.startswith("-"):
+                continue
+            if os.path.isdir(_a) and (os.path.isfile(os.path.join(_a, "profile.json"))
+                                      or os.path.isfile(os.path.join(_a, "meta.jsonl"))):
+                _path = _a
+            else:
+                try:
+                    if P.exists(P.sanitize(_a)):
+                        _path = _a
+                except Exception:
+                    pass
+            if _path:
+                rest = [x for x in rest if x != _path]
+                break
     if _path:
         if os.path.isdir(_path) and os.path.isfile(os.path.join(_path, "profile.json")):
             args.profile = os.path.basename(os.path.abspath(_path).rstrip("\\/"))

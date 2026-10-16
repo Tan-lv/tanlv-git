@@ -91,8 +91,8 @@ def build_cfg_from_session(dirs) -> Config:
             valid = {f.name for f in fields(Config)}
             for k, v in raw.items():
                 if k in valid:
-                    if k in ("game_res", "game_crop", "labels", "animation_neg_end_ms",
-                             "approach_neg_end_ms"):
+                    if v is not None and k in ("game_res", "game_crop", "labels", "crop_rel",
+                                               "animation_neg_end_ms", "approach_neg_end_ms"):
                         v = tuple(v)
                     setattr(cfg, k, v)
             break

@@ -101,7 +101,7 @@ def parse_args(argv=None):
                    help="每个 worker 预取几批。内存占用 ≈ workers x prefetch x batch_size "
                         "x 3.6MB，调太大（比如 12x4x64）会直接把内存打爆")
     p.add_argument("--patience", type=int, default=15, help="val_acc 不提升多少轮后早停")
-    p.add_argument("--split-mode", default="time_balanced",
+    p.add_argument("--split-mode", default="by_session",
                    choices=["time_balanced", "time_block", "random"],
                    help="time_balanced=按时间段均衡（推荐）；time_block=纯时间分块；random=旧做法（会泄漏）")
     p.add_argument("--val-ratio", type=float, default=0.15)
@@ -142,8 +142,9 @@ def parse_args(argv=None):
     p.add_argument("--no-synth-neg-kinds", default=None,
                    help="逗号分隔的样本 kind：这些 kind 不参与合成 N 负样本"
                         "（默认 relabel —— 8_标注界面.py 人工挑帧标出来的）")
-    p.add_argument("--neg-ratio", type=float, default=0.0,
-                   help="每个子集里负样本最多是正样本的几倍（0=不限）。"
+    p.add_argument("--neg-ratio", type=float, default=1.0,
+                   help="每个子集里负样本最多是正样本的几倍（默认 1.0：负样本 ≤ 正样本，"
+                        "于是 N 最多占一半；0 = 不限）。"
                         "负样本会随数据集膨胀，太多既拖慢训练、又把模型压得太保守")
     p.add_argument("--speed-balance", type=float, default=0.0,
                    help="按速度重加权的强度 0~1（游戏速度随存活时间上升，"
@@ -413,6 +414,17 @@ def train(argv=None) -> int:
     #   训练，不如明确剔除，并在日志里写清每个被剔除的类在三个子集里各有多少个。
     _ntr = Counter(samples[i]["label"] for i in sp["train"])
     _rare = [l for l in labels if _ntr.get(l, 0) < args.min_train_samples]
+    # ★ 2026-10-16（用户："为什么训练的时候没有 N？不是说 37 帧里除了 6 帧会拿一部分当 N 吗"）：
+    #   判"稀有类"时**必须把合成负样本算进去**。N 的手动样本通常很少（按 n 是体力活），
+    #   但每个按键样本的胶片条还能合成出"换道动画中""障碍还远"两类 N 负样本，动辄几百上千个。
+    #   以前只数手动样本 -> N 被判稀有 -> 从 labels 里删掉 -> 合成负样本也跟着失效
+    #   （core/dataset.py：'N' not in labels -> 直接返回空）—— 一步把"别动"的监督全关了。
+    if "N" in _rare and (getattr(cfg, "animation_neg_enabled", True)
+                         or getattr(cfg, "approach_neg_enabled", True)):
+        _rare = [l for l in _rare if l != "N"]
+        log("        [rare] N 手动样本只有 %d 个，但会从胶片条合成大量"
+            "「换道动画 / 障碍还远」负样本 —— **保留 N 类**"
+            "（否则「别动」的监督会被整个关掉）" % _ntr.get("N", 0))
     if _rare:
         log(f"[rare] 训练集样本不足 {args.min_train_samples} 个的类别不参与训练：{_rare}")
         for _l in _rare:
@@ -454,13 +466,20 @@ def train(argv=None) -> int:
         for _nm, _cur, _npos in (("train", neg_tr, len(sp["train"])),
                                  ("val", neg_va, len(sp["val"])),
                                  ("test", neg_te, len(sp["test"]))):
-            _cap = int(_npos * args.neg_ratio)
+            _cap = int(_npos * args.neg_ratio)          # ★ 自动算出来的上限
             if len(_cur) > _cap:
                 log(f"[neg] {_nm} 负样本 {len(_cur)} -> {_cap}"
-                    f"（--neg-ratio {args.neg_ratio}）")
+                    f"（上限 = 正样本 {_npos} x --neg-ratio {args.neg_ratio}）")
                 _cur = _rng.sample(_cur, _cap)
+            elif _cur:
+                log(f"[neg] {_nm} 负样本 {len(_cur)}（正样本 {_npos}，"
+                    f"未超上限 {_cap} = {_npos} x {args.neg_ratio}）")
             _capped.append(_cur)
         neg_tr, neg_va, neg_te = _capped
+        _n_tr = len(sp["train"]) + len(neg_tr)
+        if _n_tr:
+            log(f"[neg] 训练条目 {_n_tr} = 正样本 {len(sp['train'])}"
+                f" + 负样本 {len(neg_tr)}；负样本占 {100.0*len(neg_tr)/_n_tr:.0f}%")
     if "N" in labels:
         bd = {k: negative_breakdown(samples, sp[k], cfg, labels)
               for k in ("train", "val", "test")}
@@ -848,6 +867,24 @@ def train(argv=None) -> int:
     log(f"  model_meta.json 的 test_acc / macro_f1 记的是【全量】那一栏：{te_acc:.4f} / {macro_f1:.4f}")
     log("      【真实样本】那一栏在 real_only_acc / real_only_macro_f1 字段。")
     log("=" * 78)
+
+    # ★ 2026-10-16（用户："验证 macro-F1 0.72，真实测试 0.56，差距大。建议按会话/局划分"）：
+    #   把"验证集比测试集好太多"这件事自动指出来 —— 这基本就是划分泄漏的信号。
+    _gap = best_acc - r_acc
+    if _gap > 0.10:
+        log("")
+        log("=" * 78)
+        log(f"[!] 验证集 acc {best_acc:.3f} 比真实测试 acc {r_acc:.4f} 高 {_gap:+.3f} —— 差距过大")
+        log("    最常见的原因是**划分泄漏**：训练集和验证集来自同一局/同一个会话，")
+        log("    画面高度相关（相邻样本的胶片条窗口甚至重叠），验证分自然虚高。")
+        log("    怎么办：")
+        log("      ① 多采几局/几个会话 —— 这是根治，单会话无论怎么分都不诚实；")
+        log("      ② 确认划分方式是 by_session（现在默认）：")
+        log("         python 4_训练.py --split-mode by_session")
+        log("         它会先把数据按「会话 / 局」分组，整组一起进 train/val/test，不切开；")
+        log("      ③ 看开头 [split] 那几行 —— 若提示「只有 1 组…退回 time_balanced」，")
+        log("         说明这次数据本身只有一局，验证分只能当参考。")
+        log("=" * 78)
 
     metrics = {"test_loss": te_loss, "test_acc": te_acc, "macro_f1": macro_f1,
                "real_only_acc": r_acc, "real_only_macro_f1": r_f1,

@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<title>会话复核</title>
+<style>
+:root{--bg:#0d1117;--panel:#161b22;--panel2:#1c2129;--line:#30363d;--fg:#e6edf3;--dim:#8b949e;--acc:#2d7dd2;--ok:#3fb950;--bad:#f85149}
+*{box-sizing:border-box} body{margin:0;font:14px/1.55 "Microsoft YaHei",system-ui,sans-serif;background:var(--bg);color:var(--fg)}
+header{display:flex;gap:14px;align-items:center;padding:8px 14px;background:var(--panel);border-bottom:1px solid var(--line);flex-wrap:wrap}
+header .sp{flex:1} .k{color:var(--dim)} .v{font-weight:600}
+.bar{width:180px;height:8px;background:#21262d;border-radius:5px;overflow:hidden}
+.bar i{display:block;height:100%;background:linear-gradient(90deg,var(--acc),var(--ok));width:0}
+main{display:flex;height:calc(100vh - 47px)}
+aside{width:250px;background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column}
+aside h3{margin:8px 10px 4px;font-size:12px;color:var(--dim);font-weight:600}
+#filters{display:flex;flex-wrap:wrap;gap:4px;padding:0 8px 6px}
+#list{overflow:auto;flex:1;padding:0 6px 10px}
+#list div{padding:3px 7px;border-radius:5px;cursor:pointer;display:flex;justify-content:space-between;gap:6px;font-size:13px}
+#list div:hover{background:var(--panel2)} #list div.cur{background:var(--acc);color:#fff}
+#list span.lb{color:var(--dim)} #list div.cur span.lb{color:#dbe9ff}
+section{flex:1;display:flex;flex-direction:column;min-width:0}
+#stage{flex:1;overflow:auto;background:#010409;display:flex;align-items:center;justify-content:center;padding:8px}
+#strip{image-rendering:crisp-edges;max-width:100%;max-height:100%;cursor:zoom-in}
+#strip.one{max-width:none;max-height:none;cursor:zoom-out}
+footer{background:var(--panel);border-top:1px solid var(--line);padding:7px 12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+button{margin:0;padding:5px 10px;background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:6px;cursor:pointer;font-size:13px}
+button:hover{border-color:var(--acc)} button.lab{min-width:52px;font-weight:700}
+button.lab.cur{outline:2px solid var(--acc)} button.del{background:#3d1d1d;border-color:#7d2b2b}
+button.go{background:var(--acc);border-color:var(--acc);color:#fff}
+.hint{color:var(--dim);font-size:12px}
+#win{background:var(--panel);border-top:1px solid var(--line);padding:6px 10px}
+#winrow{display:flex;gap:8px;margin-top:4px;overflow-x:auto}
+#winrow figure{margin:0;text-align:center;flex:0 0 auto}
+#winrow img{height:150px;image-rendering:crisp-edges;border:1px solid var(--line);background:#000}
+#winrow figcaption{color:var(--dim);font-size:11px}
+</style></head><body>
+<header>
+  <span class="k">会话</span><span class="v" id="sess">-</span>
+  <span class="k">进度</span><span class="v" id="prog">0 / 0</span>
+  <div class="bar"><i id="pbar"></i></div>
+  <span class="sp"></span>
+  <span class="k">当前</span><span class="v" id="cur">-</span>
+  <span class="k">标签</span><span class="v" id="lab">-</span>
+  <span class="k">时长/帧</span><span class="v" id="meta">-</span>
+</header>
+<main>
+  <aside>
+    <h3>按类别过滤</h3><div id="filters"></div>
+    <h3>样本列表 <span id="nshow" class="k"></span></h3>
+    <div id="list"></div>
+  </aside>
+  <section>
+    <div id="stage"><img id="strip" alt="点这里切换 适应窗口 / 1:1"></div>
+    <div id="win"><b>模型真正吃的那几帧</b> <span class="k" id="winhint"></span>
+      <div id="winrow"></div></div>
+    <footer>
+      <span class="k">改成</span><span id="labels"></span>
+      <button id="bPrev">← 上一个</button><button id="bNext" class="go">下一个 →</button>
+      <button id="bFit">适应窗口 (f)</button>
+      <button id="bDel" class="del">删除 (Del)</button>
+      <span class="hint">快捷键：← → 翻页 · 1~6 或直接按 A/D/N/Q/S/W 改标签 · Del 删除 · f 缩放</span>
+    </footer>
+  </section>
+</main>
+<script>
+var S = {list:[], i:0, only:null, labels:[], sess:"", counts:{}, total:0};
+function api(u, o){ return fetch(u, o).then(function(r){ return r.json(); }); }
+function el(id){ return document.getElementById(id); }
+function show(d){
+  S.sess = d.session; S.labels = d.labels; S.counts = d.by_label; S.total = d.total_all;
+  S.list = d.samples.filter(function(s){ return !S.only || s.label === S.only; });
+  el("sess").textContent = d.session.split(/[\\/]/).pop();
+  var f = el("filters"); f.innerHTML = "";
+  var bAll = document.createElement("button"); bAll.textContent = "全部 " + d.total_all;
+  bAll.className = S.only ? "" : "go"; bAll.onclick = function(){ filt(null); }; f.appendChild(bAll);
+  d.labels.forEach(function(L){
+    var b = document.createElement("button"); b.textContent = L + " " + (S.counts[L] || 0);
+    if (S.only === L) b.className = "go";
+    b.onclick = function(){ filt(L); }; f.appendChild(b);
+  });
+  var lb = el("labels"); lb.innerHTML = "";
+  d.labels.forEach(function(L, k){
+    var b = document.createElement("button"); b.className = "lab"; b.textContent = (k+1) + " " + L;
+    if (S.list[S.i] && S.list[S.i].label === L) b.className += " cur";
+    b.onclick = function(){ setLab(L); }; lb.appendChild(b);
+  });
+  render();
+}
+function render(){
+  var n = S.list.length;
+  el("prog").textContent = (n ? S.i + 1 : 0) + " / " + n + "（全部 " + S.total + "）";
+  el("pbar").style.width = (n ? (100.0 * (S.i + 1) / n) : 0) + "%";
+  if (!n){ el("strip").removeAttribute("src"); el("cur").textContent = "（这个类别没有样本）"; return; }
+  var s = S.list[S.i];
+  el("strip").src = "/strip?id=" + encodeURIComponent(s.id) + "&t=" + Date.now();
+  el("cur").textContent = s.id; el("lab").textContent = s.label;
+  el("meta").textContent = (s.kind || "-") + " / " + (s.n_frames || "?") + " 帧";
+  loadWin(s);
+  [].forEach.call(document.querySelectorAll("button.lab"), function(b, k){
+    b.className = "lab" + (S.labels[k] === s.label ? " cur" : "");
+  });
+  var list = el("list"); list.innerHTML = "";
+  var op = document.createDocumentFragment();
+  S.list.forEach(function(x, k){
+    var d = document.createElement("div"); if (k === S.i) d.className = "cur";
+    var a = document.createElement("b"); a.textContent = x.id;
+    var l = document.createElement("span"); l.className = "lb"; l.textContent = x.label;
+    d.appendChild(a); d.appendChild(l);
+    d.onclick = function(){ S.i = k; render(); };
+    op.appendChild(d);
+  });
+  list.appendChild(op);
+  var curEl = list.querySelector("div.cur");
+  if (curEl && curEl.scrollIntoView) curEl.scrollIntoView({block:"nearest"});
+  el("nshow").textContent = "（显示 " + n + " 个）";
+}
+function loadWin(s){
+  api("/api/window?id=" + encodeURIComponent(s.id)).then(function(w){
+    var row = el("winrow"); row.innerHTML = "";
+    if (w.error){ el("winhint").textContent = w.error; return; }
+    el("winhint").textContent = "（连续 " + w.K + " 帧 · 步长 " + w.stride +
+      " · 结束于按键前 " + w.end_offset_ms + "ms；这几帧就是 CNN 的输入）";
+    w.frame_idx.forEach(function(i, k){
+      var f = document.createElement("figure");
+      var im = document.createElement("img");
+      im.src = "/frame?id=" + encodeURIComponent(s.id) + "&i=" + i + "&t=" + Date.now();
+      im.onclick = fit;
+      var c = document.createElement("figcaption");
+      var ms = w.ms[k];
+      c.textContent = (ms === null ? ("#" + i) : ((ms >= 0 ? "+" : "") + ms + "ms"));
+      f.appendChild(im); f.appendChild(c); row.appendChild(f);
+    });
+  });
+}
+function go(d){ if (!S.list.length) return; S.i = (S.i + d + S.list.length) % S.list.length; render(); }
+function filt(L){ S.only = L; S.i = 0; load(); }
+function setLab(L){
+  if (!S.list.length) return;
+  var s = S.list[S.i];
+  api("/api/relabel", {method:"POST", headers:{"Content-Type":"application/json"},
+       body: JSON.stringify({id: s.id, label: L})}).then(function(r){
+    if (r.error){ alert(r.error); return; }
+    S.counts[s.label] = Math.max(0, (S.counts[s.label] || 1) - 1);
+    S.counts[L] = (S.counts[L] || 0) + 1;
+    s.label = L; s.id = r.id;
+    if (S.only && S.only !== L){ S.list.splice(S.i, 1); if (S.i >= S.list.length) S.i = 0; render(); }
+    else { go(1); }
+  });
+}
+function del(){
+  if (!S.list.length) return;
+  var s = S.list[S.i];
+  if (!confirm("删除 " + s.id + " ？\n\n文件和 meta.jsonl 里那一行都会被删掉，不能撤销。")) return;
+  api("/api/delete", {method:"POST", headers:{"Content-Type":"application/json"},
+       body: JSON.stringify({id: s.id})}).then(function(r){
+    if (r.error){ alert(r.error); return; }
+    S.counts[s.label] = Math.max(0, (S.counts[s.label] || 1) - 1); S.total = Math.max(0, S.total - 1);
+    S.list.splice(S.i, 1); if (S.i >= S.list.length) S.i = 0; render();
+  });
+}
+function fit(){ el("strip").classList.toggle("one"); }
+function load(){ api("/api/list").then(show); }
+el("bPrev").onclick = function(){ go(-1); };
+el("bNext").onclick = function(){ go(1); };
+el("bDel").onclick = del;
+el("bFit").onclick = fit;
+el("strip").onclick = fit;
+document.addEventListener("keydown", function(e){
+  if (e.key === "ArrowLeft"){ go(-1); e.preventDefault(); }
+  else if (e.key === "ArrowRight" || e.key === " "){ go(1); e.preventDefault(); }
+  else if (e.key === "Delete"){ del(); }
+  else if (e.key === "f" || e.key === "F"){ fit(); }
+  else {
+    var L = (e.key || "").toUpperCase();
+    var k = S.labels.indexOf(L); if (k < 0) k = "123456".indexOf(e.key);
+    if (k >= 0 && S.labels[k]) setLab(S.labels[k]);
+  }
+});
+load();
+</script></body></html>

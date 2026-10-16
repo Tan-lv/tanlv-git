@@ -498,6 +498,56 @@ def split_indices(samples: Sequence[dict], train_ratio=0.7, val_ratio=0.15,
                 out[k] = out[k][boundary_gap:-boundary_gap] if len(out[k]) > 2 * boundary_gap else out[k]
         return out
 
+    if mode == "by_session":
+        # ★ 2026-10-16（用户："验证 macro-F1 0.72，真实测试 0.56，差距大，
+        #   建议按会话/局划分，不要按帧随机分"）：
+        #   同一个会话（或同一局）里的画面高度相关 —— 相邻样本的胶片条窗口甚至重叠。
+        #   在会话内部切分，验证集和训练集就是同一局的邻居，val 必然虚高。
+        #   这里把"整段会话 / 整局"当成划分的最小单位，绝不切开。
+        groups: Dict[str, List[int]] = {}
+        for i in idx:
+            g = samples[i].get("_root") or samples[i].get("session") or "?"
+            groups.setdefault(str(g), []).append(i)
+        n_sess = len(groups)
+        if n_sess < 3:
+            # 只有一个会话时退化成"按局"：两次按键间隔超过 gap_s 就认为是新的一局
+            #   （死亡后重新开局、切菜单都会造成这种空档）
+            gap_s = max(5.0, 2.0 * float(segment_seconds))
+            groups, cur, prev = {}, [], None
+            for i in order:
+                t = float(samples[i]["t_anchor"])
+                if prev is not None and (t - prev) > gap_s:
+                    groups["局%d" % (len(groups) + 1)] = cur
+                    cur = []
+                cur.append(i)
+                prev = t
+            if cur:
+                groups["局%d" % (len(groups) + 1)] = cur
+            print(f"[split] 只有 {n_sess} 个会话 -> 按【局】划分："
+                  f"间隔 > {gap_s:.0f}s 算新的一局，共 {len(groups)} 局")
+        else:
+            print(f"[split] 按【会话】划分：共 {n_sess} 个会话，整个会话一起进 train/val/test")
+        if len(groups) < 3:
+            print(f"[split] [警告] 只有 {len(groups)} 组（会话/局），没法分三份 —— "
+                  f"退回 time_balanced（会低估误差！建议多采几局/几个会话）")
+            mode = "time_balanced"          # 下面走原来的逻辑
+        else:
+            # 整组分配：按组大小从大到小，每次丢给"离目标还差最多"的那个集合
+            targets = {k: max(ratios[k] * n, 1.0) for k in ("train", "val", "test")}
+            out = {"train": [], "val": [], "test": []}
+            for _name, g in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+                k = min(out, key=lambda kk: (len(out[kk]) - targets[kk]) / targets[kk])
+                out[k] += g
+            for k in out:
+                out[k] = sorted(out[k])
+            print("[split] 各组大小: %s  ->  train %d / val %d / test %d"
+                  % ("、".join("%s:%d" % (nm, len(g)) for nm, g in
+                               sorted(groups.items(), key=lambda kv: -len(kv[1]))),
+                     len(out["train"]), len(out["val"]), len(out["test"])))
+            if boundary_gap > 0:
+                pass                        # 整组划分本来就不相邻，不需要再丢边界样本
+            return out
+
     if mode != "time_balanced":
         raise ValueError(f"未知 mode: {mode}")
 

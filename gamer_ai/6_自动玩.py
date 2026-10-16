@@ -56,7 +56,61 @@ from __future__ import annotations
 #     之前默认的 `20261011_204728_20261011_2134` 是训崩的那版（真实 acc 0.1529），别再用了。
 #     启动时会打印 [取景] 说明这次用的是模型自带区域还是项目 geometry.json。
 # ==============================================================================
-MODEL_DIR = r"D:\deeplearning\make_dataset\gamer_ai\profiles\cs01\runs\横屏_v1"
+MODEL_DIR = r"D:\deeplearning\make_dataset\gamer_ai\profiles\sys_gamer\runs\sys_gamer_20261015_2152"
+
+
+# ==============================================================================
+#  ★★★  自动玩的行为参数：改下面几行（改完直接 Run）  ★★★
+# ------------------------------------------------------------------------------
+#  置信度阈值：模型预测的置信度低于它，就**不按键**（宁可不动，也别乱动）
+#      None                      = 用模型目录里的 thresholds.json（没有就用默认 0.85）
+#      0.90                      = 所有动作统一用 0.90
+#      {"default": 0.85,          = ★ 每个动作单独设（推荐）：
+#       "W": 0.95,                  W(跳) 要更自信才跳；A/D(左右) 稍保守；S(滚) 放宽
+#       "A": 0.90, "D": 0.90,
+#       "S": 0.80}
+#   没写的类别用 "default"。命令行 --conf（全局）/ --conf-class W=0.95,A=0.9（按动作）优先级最高。
+CONF_THRESHOLD ={"default": 0.85,
+                  "W": 0.70,
+                  "A": 0.70,
+                  "D": 0.70,
+                  "S": 0.70}
+
+
+def resolve_thresholds(base_thr: dict, args) -> dict:
+    """算出这次真正生效的阈值表 {类别/"default": 阈值}。
+
+    优先级（后者覆盖前者）：
+        thresholds.json 里的值  <  文件开头的 CONF_THRESHOLD  <  命令行 --conf / --conf-class
+    ★ 2026-10-16 用户问"每个动作的阈值可以自己设置吗" —— 可以，这里就是入口。
+    """
+    thr = dict(base_thr or {})
+    conf = CONF_THRESHOLD
+    if conf is not None:
+        if isinstance(conf, dict):
+            for k, v in conf.items():
+                thr["default" if str(k).lower() == "default" else str(k).upper()] = float(v)
+        else:
+            thr["default"] = float(conf)
+    if getattr(args, "conf", None) is not None:
+        thr["default"] = float(args.conf)
+    spec = getattr(args, "conf_class", None)
+    if spec:
+        for item in str(spec).replace(";", ",").split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if "=" not in item:
+                raise SystemExit("[阈值] --conf-class 要写成 W=0.95,A=0.9 这种")
+            k, v = item.split("=", 1)
+            thr["default" if k.strip().lower() == "default" else k.strip().upper()] = float(v)
+    return thr
+#  同方向动作锁定（毫秒）：A 之后按 A 要等这么久；A 之后按 D/W/S 不受影响
+LOCKOUT_MS = 320
+#  全局最小发键间隔（毫秒）：防止两个不同方向连得太密
+MIN_GAP_MS = 80
+#  延迟取帧（毫秒）：让模型看"现在-delay"时刻的画面，补偿"动作偏早"。别超过 50
+DELAY_MS = 0
 
 
 import argparse
@@ -113,6 +167,22 @@ class Player:
         self.args = args
         run_dir = args.run if os.path.isabs(args.run) else resolve_path(args.run)
         self.meta, ckpt, self.thr = load_run(run_dir)
+        # ★ 2026-10-16（用户："怎么没有可以修改置信度的地方"）：
+        #   优先级 命令行 --conf > 文件开头的 CONF_THRESHOLD > 模型目录的 thresholds.json
+        if getattr(args, "auto_calib", True) and not args.calibrate:
+            print("[标定] 平时自动标定：开着（正常玩就行，退出时会用刚才的数据重算阈值；"
+                  "数据太少不会覆盖。想关掉加 --no-calibrate）")
+        _has = os.path.isfile(os.path.join(run_dir, "thresholds.json"))
+        self.thr = resolve_thresholds(self.thr, args)
+        _def = float(self.thr.get("default", 0.85))
+        _per = {k: v for k, v in self.thr.items() if k != "default"}
+        print("[阈值] default=%.2f%s   %s   （来源：%s）"
+              % (_def, "  按动作单独设：" if _per else "",
+                 "  ".join("%s=%s" % (k, v) for k, v in sorted(_per.items())),
+                 "命令行" if (getattr(args, "conf", None) is not None
+                              or getattr(args, "conf_class", None))
+                 else ("文件开头 CONF_THRESHOLD" if CONF_THRESHOLD is not None
+                       else ("模型 thresholds.json" if _has else "默认值（没有 thresholds.json）"))))
         m = self.meta
         self.labels = list(m["labels"])
         # ★ 2026-10-15（用户反馈"不同游戏的模型、按键、数据集会对不上"）：用同一套对齐规则
@@ -171,13 +241,18 @@ class Player:
         #          ④ config.py 的 crop_rel / 横竖屏预设（capture 里兜底）
         #   存的是**比例 + 标定分辨率**，所以模型换分辨率/换模拟器也能自己对准。
         #   这样"训练不同区域的模型"之间可以直接切换，不用手改任何参数。
-        if args.game_res or args.game_crop:
-            # 显式给的像素框 -> 换算成相对比例，走同一条取景通道（但在最前面）
-            _rel = rel_from_crop(cfg.game_res[0], cfg.game_res[1], cfg.game_crop)
-            self.geo = {"crop_rel": list(_rel), "_source": "命令行 --game-res/--game-crop"}
-            print("[取景] 命令行显式指定：game_res=%s game_crop=%s -> crop_rel=%s"
-                  % (tuple(cfg.game_res), tuple(cfg.game_crop),
-                     tuple(round(float(v), 4) for v in _rel)))
+        if args.game_res or args.game_crop or getattr(args, "no_auto_geometry", False):
+            # ★ 2026-10-16（用户："获取识别区域好像自动改"）：
+            #   以前就算显式给了 --game-crop 的**绝对像素**，也会被转成比例再按探测到的
+            #   画面尺寸换算回去 —— 结果和你给的像素不一样，看着就像程序自己改了区域。
+            #   现在：显式给像素框 / 加 --no-auto-geometry，就**关掉自动探测**，
+            #   像素框原样使用（窗口被挪动/缩放导致对不上时，会在下面打印警告）。
+            cfg.auto_geometry = False
+            self.geo = None
+            print("[取景] 固定像素框（已关闭自动探测）：game_res=%s  game_crop=%s"
+                  % (tuple(cfg.game_res), tuple(cfg.game_crop)))
+            print("       窗口尺寸变了它也不会自己缩放 —— 想让程序自动对准就去掉 "
+                  "--game-res/--game-crop/--no-auto-geometry")
         else:
             # 模型自带 -> 区域档案 -> 项目 geometry.json（见 geometry.deploy_geometry）
             _pg = None
@@ -190,8 +265,9 @@ class Player:
                                        extra_src=("区域档案 %s" % _pn) if _pn else None)
         if self.geo:
             print(f"[取景] {self.geo['_source']}：{geo_describe(self.geo)}")
-        else:
+        elif getattr(cfg, "auto_geometry", True):
             print("[取景] 没有取景文件，按 config.py / 横竖屏预设对准")
+        # 固定像素框模式下上面已经打印过了，这里不再重复说"没有取景文件"
         # 落盘帧形状和训练时不一致 -> 前处理「短边缩到 224 + 中心裁 224」会让模型
         # 看到完全不同的有效视野，这时识别大概率失效，必须先说清楚。
         _th = int(m.get("frame_h", 0))
@@ -384,7 +460,10 @@ class Player:
             self.ticks += 1
             now = time.time()
 
-            if args.calibrate:
+            # ★ 2026-10-16（用户："让程序自己标定作为默认"）：正常玩的时候也记录
+            #   （每帧一条 (时刻, 置信度, 预测类别)，40fps 下一分钟才 2400 条，开销可忽略），
+            #   退出时用"人是否随后 200ms 内按键"来算最佳阈值并写 thresholds.json。
+            if args.calibrate or getattr(args, "auto_calib", True):
                 self.t_calib.append((now, conf, label))
                 if now - status_t > 2:
                     speed = self._live_speed()
@@ -475,16 +554,36 @@ class Player:
         print(f"       建议阈值 {best_t:.2f}（Youden J={best_j:.3f}）")
         print(f"       参考：conf 分位 50%={np.percentile(conf,50):.3f} "
               f"90%={np.percentile(conf,90):.3f} 99%={np.percentile(conf,99):.3f}")
+        # ★ 2026-10-16：平时自动标定可能只玩了几十秒 —— 数据太少就别覆盖原来那份好的。
+        if len(rows) < 200 or act.sum() < 20:
+            print("       [跳过] 数据太少（帧 <200 或 人按键 <20 次）—— 不覆盖已有的 thresholds.json")
+            print("              想认真标定就跑一轮： python 6_自动玩.py --calibrate")
+            return
         out = {"default": round(best_t, 2)}
         for lab in self.labels:
             sub = [r[0] for r in rows if r[2] == lab]
             if sub:
                 out[lab] = round(min(0.99, max(0.5, best_t + 0.05)), 2)
         p = os.path.join(self.args.run, "thresholds.json")
+        old = None
+        if os.path.isfile(p):                     # 写前备份，旧值一并打出来对比
+            try:
+                old = json.load(open(p, encoding="utf-8"))
+            except Exception:
+                old = None
+            import shutil, time as _t
+            bak = p + ".bak_" + _t.strftime("%Y%m%d_%H%M%S")
+            try:
+                shutil.copy2(p, bak)
+                print(f"       （旧文件已备份：{os.path.basename(bak)}）")
+            except Exception:
+                pass
         with open(p, "w", encoding="utf-8") as f:
             json.dump(out, f, ensure_ascii=False, indent=2)
+        if old is not None and old != out:
+            print("       旧: " + json.dumps(old, ensure_ascii=False))
         print(f"       已写出 {p}: {out}")
-        print("       下次直接 --run 就会自动读它")
+        print("       下次直接 --run 就会自动读它（想关掉自动标定：--no-calibrate）")
         self._report_lead(best_t)
 
     def _report_lead(self, thr: float) -> None:
@@ -713,7 +812,7 @@ class Player:
             self._display_done.wait(timeout=5.0)   # 等录制线程把文件写完再退出
         listener.stop()
         self.cap.close()
-        if self.args.calibrate:
+        if self.args.calibrate or getattr(self.args, "auto_calib", True):
             self.report_calibration()
         what = "拟发键" if self.args.dry_run else "发键"
         print(f"\n结束：{what} {self.sent} 次，被动作锁定拦下 {self.lockout_hits} 次，"
@@ -773,22 +872,34 @@ def main() -> None:
                          "再退回当前游戏（模型说了算，免得按错键）")
     ap.add_argument("--keys", default=None,
                     help="临时指定按键表（最高优先级）：w,s,a,d,q,n 或 w=W,n=N")
+    ap.add_argument("--no-auto-geometry", action="store_true",
+                    help="关掉自动探测：直接用模型 meta 里的 game_res/game_crop **像素框**，"
+                         "不做按比例换算（窗口被挪动/缩放时画面会对不上，但区域绝对不变）")
     ap.add_argument("--game-res", default=None,
                     help="临时覆盖游戏分辨率（横屏用 1280,720），不改 model_meta")
     ap.add_argument("--game-crop", default=None,
                     help="临时覆盖裁剪框 x,y,宽,高（横屏建议 345,0,590,720，比例与 720:880 相同）")
     ap.add_argument("--content-offset", default=None,
                     help="安卓画面在窗口内的左上角偏移 x,y（默认自动算：水平居中+底部对齐）")
-    ap.add_argument("--calibrate", action="store_true", help="标定阈值（不发键）")
-    ap.add_argument("--lockout-ms", type=int, default=320,
+    ap.add_argument("--calibrate", action="store_true",
+                    help="只标定阈值（不发键，专跑一轮采集置信度数据）")
+    ap.add_argument("--no-calibrate", dest="auto_calib", action="store_false", default=True,
+                    help="关掉「平时自动标定」（默认开：正常玩时顺便记录，退出时自动写 thresholds.json）")
+    ap.add_argument("--conf-class", default=None,
+                    help="按动作单独设阈值：--conf-class W=0.95,A=0.9,S=0.8"
+                         "（没写的动作用 default）")
+    ap.add_argument("--conf", type=float, default=None,
+                    help="置信度阈值：低于它就不按键（不填就用模型目录的 thresholds.json / 0.85）；"
+                         "想长期固定就改文件开头的 CONF_THRESHOLD")
+    ap.add_argument("--lockout-ms", type=int, default=LOCKOUT_MS,
                     help="同一方向的锁定时间，默认 320ms（覆盖换道动画）。"
                          "只锁同一个键：A 之后再按 A 要等，但 A 之后按 D/W/S 立刻放行"
                          "—— 否则 WA / WS / AA 这类连按会被全挡掉")
-    ap.add_argument("--min-gap-ms", type=int, default=80,
+    ap.add_argument("--min-gap-ms", type=int, default=MIN_GAP_MS,
                     help="任意两次发键之间的全局最小间隔，默认 80ms（防同一瞬间连发）")
     ap.add_argument("--half", action="store_true", default=True, help="FP16 推理")
     ap.add_argument("--no-half", dest="half", action="store_false")
-    ap.add_argument("--delay-ms", type=int, default=0,
+    ap.add_argument("--delay-ms", type=int, default=DELAY_MS,
                     help="延迟取帧：模型看到的是 now-delay-ms 的画面，动作整体后移，"
                          "用来补偿模型\"动作偏早\"的系统偏差。"
                          "注意会拖坏连按：实测 delay>50ms 时 WA/WS 这类快连按识别率从 95.9%% 掉到 65%%（delay=81）")
