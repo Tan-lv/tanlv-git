@@ -1013,6 +1013,12 @@ def main() -> None:
         print("[按键] 用档案 %s 里存的按键表：%s  ->  类别 %s"
               % (_prof, " ".join("%s=%s" % (k, v) for k, v in cfg.key_map.items()),
                  list(cfg.labels)))
+    # ★ 2026-11-04：按键表自检。写错一个大小写，这类样本**一条都收不到**且不报错，
+    #   所以加载完立刻检查一遍（详见 gamecfg.validate_keymap 的注释）。
+    for _w in _G.validate_keymap(cfg.key_map):
+        print("[按键警告] " + _w)
+    print("[按键] 监听这些键（按小写匹配）：%s"
+          % " ".join(sorted(str(k).lower() for k in cfg.key_map)))
     if args.session:
         cfg.session_name = args.session
     # ★ 2026-10-15：区域档案 -> 数据目录跟着档案走（老位置仍然可用）

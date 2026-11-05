@@ -144,6 +144,42 @@ def apply_keys(cfg, game: dict = None, keys: str = None) -> dict:
     return dict(cfg.key_map)
 
 
+def validate_keymap(key_map) -> List[str]:
+    """按键表自检，返回警告列表（空 = 没问题）。
+
+    ★ 2026-11-04（用户："我在这里面添加了 G 按键的数据采集和监听，为什么采集时
+      没有收集到 G 数据"）：采集端监听拿到的是 **key.lower()**，
+      所以表里写成 "Q": "G" 这种**大写源键**永远匹配不上 ——
+      按 G 时 keyid 是 "g"，查不到就静默跳过，一条样本都不产生，日志里毫无提示。
+      这个坑太隐蔽，所以在加载按键表时主动检查一次。
+    """
+    out: List[str] = []
+    seen = {}
+    for k in (key_map or {}):
+        ks = str(k)
+        if len(ks) != 1:
+            out.append("源键 %r 不是单个字符 —— 永远不会被匹配（应该只写一个字符，如 'g'）" % ks)
+            continue
+        low = ks.lower()
+        if ks != low:
+            out.append("源键 %r 是**大写**，但监听拿到的是小写 %r —— 它永远不会触发；"
+                       "如果本意是那个键，请改成 %r"
+                       % (ks, low, low))
+        if low in seen:
+            out.append("源键 %r 和 %r 归一化后都是 %r，只有一条会生效"
+                       % (seen[low], ks, low))
+        else:
+            seen[low] = ks
+    by_class: Dict[str, List[str]] = {}
+    for k, v in (key_map or {}).items():
+        by_class.setdefault(str(v), []).append(str(k))
+    for cls, keys in by_class.items():
+        if len(keys) > 1:
+            out.append("类别 %r 被多个按键映射：%s（采集都能收；上线发键只会用其中一个）"
+                       % (cls, ", ".join(repr(x) for x in keys)))
+    return out
+
+
 def train_defaults(name: str = None) -> dict:
     """这个游戏的默认训练参数字典（没有就返回 {}）。"""
     g = load(name)
@@ -191,13 +227,20 @@ def align_with_model(meta: dict, game: str = None, keys: str = None,
         act = {**_m, **_a}
         src = "命令行 --keys"
     elif model_km:
-        act = dict(model_km)
-        src = "模型自带 key_map"
+        # ★ 2026-11-04（用户："为什么这个自动玩的脚本不能自己读模型有几个按键，然后自己适配"）：
+        #   模型的 model_meta.json 里 key_map 是**「类别 -> 键」**（{"W": "w"}），
+        #   而下面统一按**「键 -> 类别」**（{"w": "W"}）处理 —— 原来直接 dict(model_km)，
+        #   结果第 238 行转出来是 {"W": "W"}：**键字符退化成了类别名**，
+        #   上线时发的是大写 A/D/W（游戏里没绑 Shift 组合），所以角色一动不动。
+        #   ADB 通道里 ch.lower() 恰好掩盖了这个问题。
+        act = {str(ch): str(lb).upper() for lb, ch in model_km.items()}
+        src = "模型自带 key_map（自动转成 键->类别）"
     elif g and (g.get("ACTION_KEYS") or g.get("MARKER_KEYS")):
         act = {**(g.get("MARKER_KEYS") or {}), **(g.get("ACTION_KEYS") or {})}
         src = "games/%s.py 的按键表" % (g.get("_name") or gname)
     else:
-        act = {lb: ch for ch, lb in _C().key_map.items()}
+        # Config.key_map 本来就是「键 -> 类别」，别再翻转一次（同上一个问题）
+        act = dict(_C().key_map)
         src = "core/config.py 默认表"
     key_map = {str(lb).upper(): ch for ch, lb in act.items()}
 

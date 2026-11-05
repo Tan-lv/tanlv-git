@@ -129,6 +129,20 @@ def parse_args(argv=None):
                    help="用哪个指标选 best.pt / 早停（默认 macro_f1：五类等权，"
                         "不会被海量合成 N 负样本骗到；acc = 老行为）")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--mirror-ad", type=float, default=0.5,
+                   help="A/D 左右镜像**互换**的概率（默认 0.5 = 每个 A/D 样本有一半概率"
+                        "水平翻转并把标签 A<->D 对调）。0 = 关闭。只作用于训练集。")
+    p.add_argument("--speed-input", action="store_true", default=True,
+                   help="把当前速度作为额外通道拼进输入（默认开）。"
+                        "同画面在低速=还远、高速=马上到，光靠像素分不出来，必须给标量")
+    p.add_argument("--no-speed-input", dest="speed_input", action="store_false",
+                   help="关掉速度标量通道（模型回到 3*K 通道的老结构）")
+    p.add_argument("--mirror-keep", type=float, default=0.5,
+                   help="W/S/G/Q 左右镜像的概率（默认 0.5 = 水平翻转但**标签不变**）。"
+                        "跳/滚是垂直动作、复活/Q 的判据也不分左右，翻转后仍成立，纯增数据。"
+                        "0 = 关闭。只作用于训练集。")
+    p.add_argument("--mirror-ws", type=float, default=None,
+                   help="（旧名，等价于 --mirror-keep）")
     p.add_argument("--amp", action="store_true", default=True)
     p.add_argument("--no-amp", dest="amp", action="store_false")
     p.add_argument("--resume", default=None, help="从 checkpoint 继续")
@@ -136,6 +150,17 @@ def parse_args(argv=None):
                    help="关闭从换道动画合成的 N 类负样本（默认开启）")
     p.add_argument("--no-approach-neg", action="store_true",
                    help="关闭从「障碍还远」合成的 N 类负样本（默认开启；治动作偏早）")
+    p.add_argument("--anim-share", type=float, default=0.6,
+                   help="负样本超过上限时，给「换道动画中」这一类的保底比例（默认 0.6）。"
+                        "被误判成 AA/DD（换道动画里又按同一个方向）多就调高；"
+                        "动作偏早/偏慢就调低，把名额让给「障碍还远」")
+    p.add_argument("--approach-neg-ms", default=None,
+                   help="覆盖「障碍还远」负样本的结束偏移（毫秒，逗号分隔，填负数，如"
+                        " -400,-500,-600）。注意必须比 -(end_offset+167) 更靠前，否则会"
+                        "和正样本窗口重叠（程序会自动丢掉重叠的那些）")
+    p.add_argument("--anim-neg-ms", default=None,
+                   help="覆盖「换道动画中」负样本的结束偏移（毫秒，逗号分隔，如 120,200,300,450）。"
+                        "不填就用采集时 session.json 记的值（默认 200,350）")
     p.add_argument("--no-synth-neg-sessions", default=None,
                    help="逗号分隔的会话名：这些会话里的样本不参与合成 N 负样本"
                         "（默认 碰撞操作 —— 人工挑帧标的撞车样本，前后帧本身是瑕疵画面）")
@@ -192,6 +217,8 @@ def build_cfg(session_dirs, args) -> Config:
         cfg.input_stride = args.input_stride
     if args.frame_w:
         cfg.frame_w = args.frame_w
+    # ★ 速度标量通道（2026-11-05）：输入通道从 3*K 变成 3*K+1
+    cfg.use_speed = bool(getattr(args, "speed_input", True))
     cfg.validate()
     return cfg
 
@@ -331,7 +358,7 @@ def evaluate(model, loader, crit, device, n_classes, use_amp):
 
 # ======================================================================
 def train(argv=None) -> int:
-    """训练主流程。**可以当普通函数调用**（2026-10-15 用户要求）：
+    r"""训练主流程。**可以当普通函数调用**（2026-10-15 用户要求）：
 
         from core import trainer
         trainer.train(["--sessions", r"gamer_ai\profiles\cs01\dataset",
@@ -386,7 +413,9 @@ def train(argv=None) -> int:
     labels = sorted(cnt.keys())
     log(f"[data] 类别顺序: {labels}")
     log(f"[data] 输入 = 连续 {cfg.input_frames} 帧, 结束于按键前 {cfg.input_end_offset_ms} ms, "
-        f"步长 {cfg.input_stride}  ->  张量通道 {cfg.input_frames*3}")
+        f"步长 {cfg.input_stride}  ->  张量通道 "
+        f"{cfg.input_frames*3 + (1 if getattr(cfg, 'use_speed', False) else 0)}"
+        + ("（含 1 个速度标量通道）" if getattr(cfg, "use_speed", False) else ""))
 
     sp = split_indices(samples, train_ratio=1 - args.val_ratio - args.test_ratio,
                        val_ratio=args.val_ratio, mode=args.split_mode,
@@ -452,6 +481,32 @@ def train(argv=None) -> int:
         cfg.animation_neg_enabled = False
     if args.no_approach_neg:
         cfg.approach_neg_enabled = False
+    if getattr(args, "approach_neg_ms", None):
+        _am = tuple(float(x) for x in str(args.approach_neg_ms).replace("，", ",").split(",")
+                    if x.strip())
+        if _am:
+            cfg.approach_neg_end_ms = _am
+            cfg.approach_neg_enabled = True
+            log("[neg] 「障碍还远」偏移被参数覆盖：%s ms" % list(_am))
+    # ★ 2026-11-04：偏移超过采集后置窗口时提醒一句（否则那些偏移会静默失效）
+    if getattr(cfg, "animation_neg_enabled", True) and cfg.animation_neg_end_ms:
+        _maxe = max(cfg.animation_neg_end_ms)
+        _post = float(getattr(cfg, "save_post_ms", 0) or 0)
+        if _post and _maxe > _post + 1:
+            log(f"[neg] [警告] 换道动画偏移最大 {_maxe:.0f}ms 超过采集后置窗口 "
+                f"{_post:.0f}ms（session.json 的 save_post_ms）—— 超过的偏移会被逐样本丢掉。"
+                f"建议改成 <= {int(_post)}ms，例如 100,200,300,{int(_post)}")
+    if getattr(args, "anim_neg_ms", None):
+        # ★ 2026-11-04：不重新采集也能加密"换道动画"的覆盖密度。
+        #   默认只取按键后 +200/+350ms 两个点；换道动画本身约 250~350ms，
+        #   起点（+80~150ms）几乎没有 N 样本，而那一段最容易和"刚按下"混淆。
+        _ms = tuple(float(x) for x in str(args.anim_neg_ms).replace("，", ",").split(",")
+                    if x.strip())
+        if _ms:
+            cfg.animation_neg_end_ms = _ms
+            cfg.animation_neg_enabled = True
+            log("[neg] 「换道动画中」偏移被参数覆盖（TRAIN 里的 anim_neg_ms 或命令行 "
+                "--anim-neg-ms）：%s ms" % list(_ms))
     neg_tr = negatives_for_subset(samples, sp["train"], cfg, labels)
     neg_va = negatives_for_subset(samples, sp["val"], cfg, labels)
     neg_te = negatives_for_subset(samples, sp["test"], cfg, labels)
@@ -468,9 +523,28 @@ def train(argv=None) -> int:
                                  ("test", neg_te, len(sp["test"]))):
             _cap = int(_npos * args.neg_ratio)          # ★ 自动算出来的上限
             if len(_cur) > _cap:
-                log(f"[neg] {_nm} 负样本 {len(_cur)} -> {_cap}"
-                    f"（上限 = 正样本 {_npos} x --neg-ratio {args.neg_ratio}）")
-                _cur = _rng.sample(_cur, _cap)
+                # ★ 2026-11-04（用户："被误判 AA、DD 的频率太高，角色还在换道动画里就被判成上一步"）：
+                #   原来超上限时是**无差别随机抽样** —— "换道动画中"这类负样本
+                #   （专门教模型"动画期间别再按同一个方向"）跟着一起被抽掉一大半：
+                #   实测 train 有 918 个动画负样本，--neg-ratio 0.3 上限 505 时只剩约 155 个，
+                #   结果测试集 N 类的 27 个错误里全是 N->A/N->D。
+                #   现在按 --anim-share 先给动画类保底，剩下的名额才给"障碍还远"。
+                _anim = [x for x in _cur if x[1] > 0]      # 正偏移 = 按键之后 = 换道动画中
+                _appr = [x for x in _cur if x[1] <= 0]     # 负偏移 = 按键之前 = 障碍还远
+                _floor = int(_cap * max(0.0, min(1.0, args.anim_share)))
+                _take_anim = max(0, min(len(_anim), max(_floor, _cap - len(_appr))))
+                _take_appr = max(0, min(len(_appr), _cap - _take_anim))
+                if _take_anim + _take_appr < _cap:         # 障碍类不够填，名额还给动画类
+                    _take_anim = max(0, min(len(_anim), _cap - _take_appr))
+                _pick = (_rng.sample(_anim, _take_anim) if _take_anim < len(_anim)
+                         else list(_anim))
+                _pick += (_rng.sample(_appr, _take_appr) if _take_appr < len(_appr)
+                          else list(_appr))
+                log(f"[neg] {_nm} 负样本 {len(_cur)} -> {len(_pick)}"
+                    f"（上限 = 正样本 {_npos} x --neg-ratio {args.neg_ratio}；"
+                    f"换道动画 {len(_anim)}->{_take_anim}（保底 {int(args.anim_share*100)}%）、"
+                    f"障碍还远 {len(_appr)}->{_take_appr}）")
+                _cur = _pick
             elif _cur:
                 log(f"[neg] {_nm} 负样本 {len(_cur)}（正样本 {_npos}，"
                     f"未超上限 {_cap} = {_npos} x {args.neg_ratio}）")
@@ -494,7 +568,13 @@ def train(argv=None) -> int:
             log(f"      [排除] {_skip} 个样本不参与负样本合成"
                 f"（会话 {list(cfg.no_synth_neg_sessions)} / kind {list(cfg.no_synth_neg_kinds)}："
                 "人工挑帧的碰撞样本，前后帧本身是瑕疵画面）")
-        log(f"      \- 障碍还远  : 按键前 {list(cfg.approach_neg_end_ms)}ms 出发，"
+        _dropped = getattr(cfg, "_approach_dropped", None)
+        if _dropped:
+            log(f"      [自动丢弃] 这些「障碍还远」偏移会和正样本窗口重叠，已跳过：{_dropped}")
+            log(f"                 规则：偏移 <= -(end_offset + 跨度) = "
+                f"-{int(cfg.input_end_offset_ms) + 167}ms 才干净（end_offset="
+                f"{cfg.input_end_offset_ms}，跨度 167ms）")
+        log(rf"      \- 障碍还远  : 按键前 {list(cfg.approach_neg_end_ms)}ms 出发，"
             f"要求之前安静 >= |偏移|+窗口+{cfg.approach_neg_quiet_margin_ms}ms"
             f"  -> train {bd['train']['approach']} / val {bd['val']['approach']}")
         if cfg.approach_neg_enabled and bd["train"]["approach"] == 0:
@@ -523,7 +603,26 @@ def train(argv=None) -> int:
             log("        [警告] 一条都没匹配上，检查会话名写法（按路径子串匹配）")
     train_ds = MultiFrameDataset([samples[i] for i in sp["train"]], cfg,
                                  build_train_transform(args.img_size), args.img_size,
-                                 labels=labels, negatives=neg_tr, weights=train_src_w)
+                                 labels=labels, negatives=neg_tr, weights=train_src_w,
+                                 mirror_ad=args.mirror_ad,
+                                 mirror_keep=(args.mirror_keep if args.mirror_ws is None
+                                              else args.mirror_ws))
+    _mir_keep = args.mirror_keep if args.mirror_ws is None else args.mirror_ws
+    if args.mirror_ad > 0 or _mir_keep > 0:
+        _cnt = {}
+        for i in sp["train"]:
+            lb = samples[i]["label"]
+            _cnt[lb] = _cnt.get(lb, 0) + 1
+        log(f"[aug] 左右镜像（只作用于训练集，验证/测试不翻，指标才可比）")
+        if args.mirror_ad > 0:
+            log(f"      |- A/D 互换：概率 {args.mirror_ad:.2f}  "
+                f"A {_cnt.get('A', 0)} 个 / D {_cnt.get('D', 0)} 个  "
+                f"-> 翻转后各自变成对方那类（A/D 数据量实际翻倍）")
+        if _mir_keep > 0:
+            log(f"      \- W/S/G/Q 增广：概率 {_mir_keep:.2f}  "
+                f"W {_cnt.get('W', 0)} / S {_cnt.get('S', 0)} / "
+                f"G {_cnt.get('G', 0)} / Q {_cnt.get('Q', 0)} 个  "
+                f"-> 翻转但标签不变（垂直动作 + 复活弹窗，判据都不分左右）")
     val_ds = MultiFrameDataset([samples[i] for i in sp["val"]], cfg,
                                build_eval_transform(args.img_size), args.img_size,
                                labels=labels, negatives=neg_va)
@@ -607,11 +706,14 @@ def train(argv=None) -> int:
                                   shuffle=False, **dl_kw)
 
     # ---------- 模型 ----------
+    _in_ch = cfg.input_frames * 3 + (1 if getattr(cfg, "use_speed", False) else 0)
     model = build_model(cfg.input_frames, len(labels),
                         pretrained=not args.no_pretrained,
-                        weights_path=args.pretrained_weights).to(device)
+                        weights_path=args.pretrained_weights,
+                        in_channels=_in_ch).to(device)
     n_param = sum(p.numel() for p in model.parameters())
-    log(f"[model] EfficientNet-B0  参数 {n_param/1e6:.2f} M  输入通道 {cfg.input_frames*3}")
+    log(f"[model] EfficientNet-B0  参数 {n_param/1e6:.2f} M  输入通道 {_in_ch}"
+        + ("（含速度标量通道：z=log1p(px/s)/4.6）" if getattr(cfg, "use_speed", False) else ""))
 
     weights = None
     if args.class_weight == "auto":
@@ -907,6 +1009,12 @@ def train(argv=None) -> int:
         "real_only_acc": r_acc, "real_only_macro_f1": r_f1,
         "frame_w": cfg.frame_w, "frame_h": cfg.frame_h, "sep": cfg.sep,
         "input_end_offset_ms": cfg.input_end_offset_ms, "input_stride": cfg.input_stride,
+        # ★ 速度标量通道：部署端（6_自动玩.py）必须照这两个字段准备输入，否则通道数对不上
+        "speed_input": bool(getattr(cfg, "use_speed", False)),
+        "in_channels": cfg.input_frames * 3 + (1 if getattr(cfg, "use_speed", False) else 0),
+        # 负样本的取样偏移也记下来：评估时复现同一套，指标才和训练日志对得上
+        "animation_neg_end_ms": list(cfg.animation_neg_end_ms or ()),
+        "approach_neg_end_ms": list(cfg.approach_neg_end_ms or ()),
         "save_pre_ms": cfg.save_pre_ms, "save_post_ms": cfg.save_post_ms,
         "save_fps": cfg.save_fps, "saved_frames": cfg.saved_frames,
         "animation_neg_enabled": cfg.animation_neg_enabled,

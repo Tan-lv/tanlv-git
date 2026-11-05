@@ -173,14 +173,21 @@ def build_animation_negatives(all_samples: Sequence[dict], cfg: Config,
         if not synth_neg_allowed(m, cfg):
             continue                      # ★ 碰撞操作/人工挑帧样本：不在它身上合成
         times = m["frame_times_ms"]
-        if not times or times[-1] < need_ms:
-            continue                      # 后置窗口不够长（旧数据），跳过
+        if not times:
+            continue
+        # ★ 2026-11-04（冒烟测试踩到的坑）：原来用 max(ends) 一刀切，
+        #   只要有一个偏移超过采集的后置窗口（save_post_ms，常见 400ms），
+        #   **所有样本都会被跳过** —— 换道动画负样本变成 0，而且日志里看不出原因。
+        #   改成逐样本过滤：窗口不够长的那个偏移丢掉，其它的照常生成。
+        ok_ends = [e for e in ends if times[-1] >= e]
+        if not ok_ends:
+            continue                      # 后置窗口比所有偏移都短（旧数据），跳过
         t = m["t_anchor"]
         k = bisect.bisect_right(anchors, t + 1e-6)
         gap_ms = (anchors[k] - t) * 1000.0 if k < len(anchors) else 1e9
         if gap_ms < getattr(cfg, "animation_neg_min_gap_ms", 700):
             continue
-        for e in ends:
+        for e in ok_ends:
             out.append((i, float(e)))
     return out
 
@@ -211,6 +218,19 @@ def build_approach_negatives(all_samples: Sequence[dict], cfg: Config,
     stride = max(1, int(cfg.input_stride))
     span = ((cfg.input_frames - 1) * stride * 1000.0
             / max(float(cfg.save_fps), 1e-6))
+    # ★ 2026-11-05（踩过两次的坑）：负样本窗口绝不能和**正样本窗口**重叠，否则同一批
+    #   帧同时被标成"该按"和"别按"，是纯噪声。
+    #   正样本窗口 = [-(E+span), -E]；负样本窗口 = [e-span, e]。
+    #   不重叠要求：e <= -(E+span)。
+    #   实测 end_offset 从 0 改成 200 后，原来 -250 的偏移就和正样本重叠了 117ms（3.5 帧）。
+    _E = float(getattr(cfg, "input_end_offset_ms", 0) or 0)
+    _pos_start = -(_E + span)
+    _ends_ok = [e for e in ends if e <= _pos_start + 1e-6]
+    if _ends_ok != ends:
+        cfg._approach_dropped = [e for e in ends if e not in _ends_ok]
+    ends = _ends_ok
+    if not ends:
+        return []
     margin = float(getattr(cfg, "approach_neg_quiet_margin_ms", 250))
     key_idx = [i for i, m in enumerate(all_samples) if m["label"] != "N"]
     anchors = sorted(all_samples[i]["t_anchor"] for i in key_idx)
@@ -384,8 +404,33 @@ class MultiFrameDataset(Dataset):
                  labels: Optional[Sequence[str]] = None,
                  negatives: Optional[Sequence[Tuple[int, float]]] = None,
                  clip_index_range: Optional[Tuple[float, float]] = None,
-                 weights: Optional[Sequence[float]] = None):
+                 weights: Optional[Sequence[float]] = None,
+                 mirror_ad: float = 0.0,
+                 mirror_ws: float = 0.0,
+                 mirror_keep=None):
         self.cfg = cfg
+        # ★ 2026-11-05（用户要求）：「A、D 方向不要随意翻转 -> 把 A 的数据镜像后
+        #   放进 D 里、D 的镜像放进 A 里」。
+        #   左移和右移在画面上就是左右镜像，所以：以 mirror_ad 的概率把整段
+        #   6 帧水平翻转，并把标签 A<->D 对调。好处有三个：
+        #     ① A/D 的样本量实际翻倍（稀有的一侧被补齐）
+        #     ② 强制模型学对称的左右判断，不会一边敏锐一边迟钝
+        #     ③ 缓解"A 记住的是画面里某个不对称线索"（金币/站台位置）导致的偏科
+        #   只对 A/D 做：G（复活弹窗）里有文字，翻转后是乱码，不能翻。
+        self.mirror_ad = float(mirror_ad or 0.0)
+        self.AD_PAIRS = {"A": "D", "D": "A"}
+        # ★ 2026-11-05（用户要求：W/S/G/Q 也能镜像，纯增数据）：
+        #   **"翻转但不换标签"** 的类：W(跳) / S(滚) / G(复活) / Q 都在这一档。
+        #     · W/S 是垂直动作，左右翻转后仍然是跳/滚
+        #     · G 是复活弹窗：虽然里面有文字（翻过来是镜像字），但区分它靠的是
+        #       大白框 + 蓝色钥匙按钮 + 人物头像，不是文字笔画；而 G 只有 35 个样本，
+        #       翻一倍对稀有类收益更大
+        #     · Q 同理（左右翻转不影响它对应的操作）
+        #   而 A/D 是**水平**动作，翻转后要**互换标签**（那是"把 A 的数据放进 D 里"）。
+        #   N 不翻：它占训练集一半，翻了纯浪费算力。
+        #   兼容旧参数名 mirror_ws（等价于 mirror_keep）。
+        self.mirror_keep = float(mirror_keep if mirror_keep is not None else (mirror_ws or 0.0))
+        self.KEEP_KEYS = {"W", "S", "G", "Q"}
         self.samples = list(samples)
         # ★ 每样本损失权重（来源加权：新数据 / 人工纠正的数据可以给更高权重）。
         #   给了就 __getitem__ 多返回一个 w，训练循环按 w 加权算 loss；
@@ -423,7 +468,27 @@ class MultiFrameDataset(Dataset):
         frames = read_strip(meta, idx)                       # (K,H,W,3)
         x = to_video_tensor(frames)                          # (K,3,H,W)
         x = self.transform(x)                                # 同一套参数作用于所有帧
+        # A/D 左右镜像互换（见 __init__ 里的说明）。必须**整段一起翻**，
+        # 不能逐帧随机翻，否则时间轴就被打乱了。
+        _p = 0.0
+        if label in self.AD_PAIRS:
+            _p = self.mirror_ad           # A/D：翻转 + 互换标签
+        elif label in self.KEEP_KEYS:
+            _p = self.mirror_keep         # W/S/G/Q：只翻转，标签不变
+        if _p > 0 and float(torch.rand(1).item()) < _p:
+            x = torch.flip(x, dims=[-1])
+            if label in self.AD_PAIRS:
+                label = self.AD_PAIRS[label]
         x = flatten_frames(x)                                # (K*3,H,W)
+        if getattr(self.cfg, "use_speed", False):
+            # ★ 速度标量通道（2026-11-05）：整张图填同一个值，作为第 3*K+1 个通道。
+            #   公式必须和部署端（6_自动玩.py 的 _input_tensor）一字不差，
+            #   否则训练/上线用的不是同一个量纲。
+            import math
+            sp = float(meta.get("speed_px_s") or 0.0)
+            z = min(math.log1p(max(0.0, sp)) / 4.6, 2.0)
+            x = torch.cat([x, torch.full((1, x.shape[-2], x.shape[-1]),
+                                         z, dtype=x.dtype)], dim=0)
         y = self.label_to_idx[label]
         if self.weights is not None:
             return x, y, float(self.weights[i] if i < len(self.weights) else 1.0)

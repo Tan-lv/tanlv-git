@@ -56,7 +56,12 @@ from __future__ import annotations
 #     之前默认的 `20261011_204728_20261011_2134` 是训崩的那版（真实 acc 0.1529），别再用了。
 #     启动时会打印 [取景] 说明这次用的是模型自带区域还是项目 geometry.json。
 # ==============================================================================
-MODEL_DIR = r"D:\deeplearning\make_dataset\gamer_ai\profiles\sys_gamer\runs\sys_gamer_20261015_2152"
+#  ★ 2026-11-04：改成 None = **自动挑当前档案 runs/ 里最新产出的模型**。
+#    这样你重训完直接 Run，跑的就是刚训出来的那版（启动会打印 [模型] 挑了哪个），
+#    不会再因为路径没更新而误跑上一次的旧模型。
+#    想固定某个模型：换成那个 run 目录的绝对路径即可（写了路径就它说了算），例如
+#      MODEL_DIR = r"D:\deeplearning\make_dataset\gamer_ai\profiles\旧版横屏_1903x1070\runs\旧版横屏_1903x1070_20261104_1908"
+MODEL_DIR = None
 
 
 # ==============================================================================
@@ -70,11 +75,25 @@ MODEL_DIR = r"D:\deeplearning\make_dataset\gamer_ai\profiles\sys_gamer\runs\sys_
 #       "A": 0.90, "D": 0.90,
 #       "S": 0.80}
 #   没写的类别用 "default"。命令行 --conf（全局）/ --conf-class W=0.95,A=0.9（按动作）优先级最高。
-CONF_THRESHOLD ={"default": 0.85,
-                  "W": 0.70,
-                  "A": 0.70,
-                  "D": 0.70,
-                  "S": 0.70}
+CONF_THRESHOLD = None
+
+
+# ------------------------------------------------------------------------------
+#  发键通道（2026-10-16 新增）：模型输出的 A/D/W/S 用哪种方式送进模拟器
+#      "key" = pynput 发键盘（老方式：**依赖雷电的「按键映射」**，且窗口必须在前台）
+#      "adb" = ADB 直接往 Android 注入触摸滑动（**不抢焦点、不受按键映射影响**）
+#
+#  为什么加这个：日志里"已发键"在涨、游戏里却一动不动。已排查掉权限（Python 和雷电
+#  都是管理员，不是 UIPI 拦截）和焦点（启动打印"模拟器已在前台"），剩下的可能是
+#  雷电「按键映射」没开，或雷电**忽略了注入的按键**（只认真实硬件按键）。
+#  ADB 通道把整个 PC 键盘层绕过去：地铁跑酷本来就是滑动手游，
+#  w/a/s/d = 上/下/左/右滑动，模型和数据集一行都不用改。
+#
+#  先用 tools\测试发键.py 确认哪种方式能让角色动，再把这里改成对应值。
+# ------------------------------------------------------------------------------
+#  ★ 2026-10-16 实测：你这台机器上雷电**只认真实硬件按键**（自己按 WASD 会动，
+#    程序注入的不动），所以 "key" 通道发不进去。默认改成 "adb"，需要时用 --send key 切回。
+SEND_MODE = "adb"
 
 
 def resolve_thresholds(base_thr: dict, args) -> dict:
@@ -106,7 +125,7 @@ def resolve_thresholds(base_thr: dict, args) -> dict:
             thr["default" if k.strip().lower() == "default" else k.strip().upper()] = float(v)
     return thr
 #  同方向动作锁定（毫秒）：A 之后按 A 要等这么久；A 之后按 D/W/S 不受影响
-LOCKOUT_MS = 320
+LOCKOUT_MS = 400
 #  全局最小发键间隔（毫秒）：防止两个不同方向连得太密
 MIN_GAP_MS = 80
 #  延迟取帧（毫秒）：让模型看"现在-delay"时刻的画面，补偿"动作偏早"。别超过 50
@@ -169,6 +188,9 @@ class Player:
         self.meta, ckpt, self.thr = load_run(run_dir)
         # ★ 2026-10-16（用户："怎么没有可以修改置信度的地方"）：
         #   优先级 命令行 --conf > 文件开头的 CONF_THRESHOLD > 模型目录的 thresholds.json
+        if not args.dry_run and not args.calibrate:
+            print("[焦点] 开跑后请**不要用鼠标点别的窗口**（模拟器必须保持前台）；"
+                  "程序每次发键前会自检并抢回焦点")
         if getattr(args, "auto_calib", True) and not args.calibrate:
             print("[标定] 平时自动标定：开着（正常玩就行，退出时会用刚才的数据重算阈值；"
                   "数据太少不会覆盖。想关掉加 --no-calibrate）")
@@ -194,10 +216,26 @@ class Player:
         self.key_map = dict(_align["key_map"])
         self.game = _align["game"] or m.get("game")
         self._align_notes = list(_align["notes"])
+        # ★ 2026-11-04：按键表自检（大写源键永远匹配不上，采集端就是这么丢掉 G 的）
+        #   注意方向：这里 self.key_map 是「类别 -> 键字符」，而自检函数要「键字符 -> 类别」，
+        #   直接传会全员误报（我第一次就写反了，7 条假警告）。
+        for _w in _GC.validate_keymap({str(c): str(lb) for lb, c in self.key_map.items()}):
+            print("[按键警告] " + _w)
+        # ★ 2026-11-04（用户："为什么不能自己读模型有几个按键，然后自己适配"）：
+        #   标定阶段原来硬编码 ch in "wasd" —— 模型有 G/Q 时你按 G/Q **不算人类操作**，
+        #   自动标定出来的阈值就偏。现在从模型按键表推：除 N（标记"不动"）外都是动作键。
+        self.human_key_chars = {str(c).lower() for lb, c in (self.key_map or {}).items()
+                                if str(lb).upper() != "N" and str(c).strip()}
         self.K = int(m["in_frames"])
         self.img_size = int(m.get("img_size", 224))
+        # ★ 2026-11-05：模型可能是 3*K 通道（老版），也可能 3*K+1（带速度标量通道）。
+        #   一律以 model_meta.json 记的为准，别自己算 —— 否则通道数对不上直接报错。
+        #   （注意：必须在下面那行 print 之前定义，否则会 AttributeError）
+        self.speed_input = bool(m.get("speed_input", False))
+        self.in_channels = int(m.get("in_channels") or (self.K * 3))
         print(f"[run] {os.path.abspath(run_dir)}")
-        print(f"      类别 {self.labels}  输入 {self.K} 帧 ({self.K*3} 通道)  "
+        print(f"      类别 {self.labels}  输入 {self.K} 帧 ({self.in_channels} 通道"
+              + ("，含速度标量" if self.speed_input else "") + ")  "
               f"test_acc {m.get('test_acc', float('nan')):.4f}")
         # ★ 2026-10-15：说清楚这次按哪张按键表发键 —— 换游戏/加按键后就靠这几行确认
         for _n in getattr(self, "_align_notes", []):
@@ -206,6 +244,15 @@ class Player:
               % (self.game or "-",
                  " ".join("%s=%s" % (lb, ch) for lb, ch in sorted(self.key_map.items()))
                  or "（空）"))
+        # ★ 2026-10-16（实测：模型 test_acc 0.61，实时置信度只有 0.5~0.75，而默认阈值 0.85
+        #   会把 98% 的帧当"低置信"丢掉 —— 表现就是"跑了半天几乎不动"）：
+        #   弱模型 + 高阈值 = 什么都不发。这里直接提醒，别等跑完才看出来。
+        _acc = float(m.get("test_acc") or 0.0)
+        _thr_def = float(self.thr.get("default", 0.85))
+        if _acc and _acc < 0.75 and _thr_def >= 0.80:
+            print(f"[警告] 这个模型 test_acc 只有 {_acc:.2f}，实时置信度常在 0.5~0.75，"
+                  f"默认阈值 {_thr_def:.2f} 会把绝大多数帧丢掉 —— 看着就像「不动」。")
+            print(f"       建议 --conf 0.55，或把文件顶部 CONF_THRESHOLD 改成 0.55")
 
         # 抓帧参数必须与训练一致
         cfg = Config()
@@ -213,6 +260,13 @@ class Player:
         cfg.game_crop = tuple(m.get("game_crop", cfg.game_crop))
         cfg.frame_w = int(m.get("frame_w", cfg.frame_w))
         cfg.backend = m.get("backend", cfg.backend)
+        # ★ 2026-11-05（用户："为什么感觉这个模型反应很慢"）：
+        #   实测抓帧耗时 printwindow 34.7ms / bitblt 10.3ms。
+        #   printwindow 能抓被遮挡的窗口，bitblt 快 3 倍但要求窗口没被别人挡住。
+        if getattr(args, "backend", None):
+            cfg.backend = args.backend
+            print(f"[取景] 抓帧后端被命令行指定为 {cfg.backend}"
+                  + ("（快，但模拟器窗口别被挡住）" if cfg.backend == "bitblt" else "（慢，但能抓被遮挡的窗口）"))
         # ★ 2026-10-10（用户转横屏）：允许命令行临时覆盖取景参数。
         #   模型权重和 game_res/game_crop/frame_w 都无关 —— 只影响"喂进去的是哪块画面"，
         #   所以同一个模型可以直接换区域试，不用重训。
@@ -292,7 +346,8 @@ class Player:
         self.transform = build_eval_transform(self.img_size)
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = build_model(self.K, len(self.labels), pretrained=False)
+        self.model = build_model(self.K, len(self.labels), pretrained=False,
+                                 in_channels=self.in_channels)
         ck = torch.load(ckpt, map_location="cpu")
         self.model.load_state_dict(ck.get("model_state_dict", ck))
         self.model = self.model.to(self.device).eval()
@@ -322,7 +377,8 @@ class Player:
         self.video_path = None
         self._video_frames = 0
         if self.cam_on:
-            self.cam_model = build_model(self.K, len(self.labels), pretrained=False)
+            self.cam_model = build_model(self.K, len(self.labels), pretrained=False,
+                                         in_channels=self.in_channels)
             self.cam_model.load_state_dict(ck.get("model_state_dict", ck))
             self.cam_model = self.cam_model.to(self.device).eval().float()
             self.cam_probe = AttentionProbe(self.cam_model, frames=self.K)
@@ -344,43 +400,147 @@ class Player:
         self.last_send = 0.0
         self.sent = 0
         self.ticks = 0
-        self.lockout_hits = 0
+        self.lockout_hits = 0    # 被"同方向锁定 320ms"挡下的次数
+        self.gap_hits = 0        # 被"全局最小间隔 80ms"挡下的次数（和锁定分开算，免得看不懂）
+        self.busy_hits = 0       # ADB 设备还在执行上一条手势，这次没发（防止命令排队越滚越慢）
         self.low_conf = 0
+        self.n_pred = 0          # 模型预测"不动"(N) 的次数：conf 再高也不会按键，这是设计
         self.last_speed = 0.0
         self.t_calib = []          # 标定用
         self.human_presses = []
         self.human_key_events = []      # [(时刻, 按的哪个键)]，标定时用来量"提前量"
+        self.self_sends = []            # 我们自己发键的时刻：用来把"程序发的键"从标定里剔掉
 
         self.keyboard = None
-        if not args.dry_run and not args.calibrate:
+        self.sender = None
+        self.send_mode = (getattr(args, "send", None) or SEND_MODE or "key").lower()
+        # dry-run 下也建 ADB sender：构造只做探测（adb devices / wm size），不发任何手势，
+        # 于是 python 6_自动玩.py --dry-run --send adb 就能"只验通道、不碰游戏"。
+        if self.send_mode == "adb" and not args.calibrate:
+            # ★ 2026-10-16：ADB 通道 —— 不抢焦点、不看按键映射，直接把触摸事件注入
+            #   Android（w/a/s/d = 上/下/左/右滑动）。为什么加见文件顶部 SEND_MODE。
+            from core.adbsend import AdbSender
+            self.sender = AdbSender()
+            print(f"[发键] 通道：{self.sender.describe()}   —— 不依赖窗口焦点和按键映射")
+            if not self.sender.available():
+                print("[发键] ⚠ ADB 不可用！先跑 python tools\\测试发键.py --check 看诊断")
+        if not args.dry_run and not args.calibrate and self.send_mode != "adb":
             from pynput.keyboard import Controller
             self.keyboard = Controller()
-            self._focus_window()
+            if not self._focus_window():
+                print("\n[焦点] ⚠ 没能把模拟器窗口切到前台 —— 按键会发给当前窗口（多半是 PyCharm），"
+                      "\n       游戏里就是一动不动。请**用鼠标点一下模拟器窗口**再开跑，"
+                      "或者先最小化/移开挡着的窗口。")
+            else:
+                print("[焦点] 模拟器已在前台，可以发键")
+        if not args.calibrate:
+            self._print_send_map()
 
     # ------------------------------------------------------------------
-    def _focus_window(self) -> None:
+    def _print_send_map(self) -> None:
+        """把「模型每个类别到底怎么发出去」打出来 —— 一眼看出哪类根本动不了。
+
+        ★ 2026-11-05（用户："按键为什么不根据模型提供的按，GQ 两个判断出来后没有去触发"）：
+          模型判出 G/Q、置信度也够（实测 P(G) 中位 1.000），但 ADB 通道里只有 w/s/a/d
+          有手势，其它键落到了"点屏幕中间"的兜底 —— 复活按钮不在正中，Q 也不是屏幕
+          按钮，于是"发了键但游戏没反应"。现在启动就把这张对照表打出来。
+        """
+        try:
+            from core.adbsend import TAP_REL
+        except Exception:
+            TAP_REL = {}
+        rows = []
+        for lb in self.labels:
+            if str(lb).upper() == "N":
+                rows.append("%s=(不发键)" % lb)
+                continue
+            ch = (self.key_map or {}).get(str(lb).upper())
+            if ch is None:
+                rows.append("%s=⚠无按键" % lb)
+                continue
+            c = str(ch).lower()
+            if getattr(self, "sender", None) is not None:
+                if c in ("w", "s", "a", "d"):
+                    rows.append("%s=%s(滑动)" % (lb, ch))
+                elif TAP_REL.get(c):
+                    rows.append("%s=%s(点击 %.2f,%.2f)" % (lb, ch, TAP_REL[c][0], TAP_REL[c][1]))
+                else:
+                    rows.append("%s=%s⚠未配手势(不会触发)" % (lb, ch))
+            else:
+                rows.append("%s=%s(键盘)" % (lb, ch))
+        print("[发键] 类别->按键：" + "  ".join(rows))
+
+    # ------------------------------------------------------------------
+    def _focus_window(self) -> bool:
+        """把模拟器窗口抢到前台。返回 True 表示抢完之后模拟器确实在前台。
+
+        ★ 2026-10-16：以前失败被 except 吞掉（静默 pass），于是"抢焦点失败"和
+          "按键被模拟器忽略"看起来一模一样 —— 都是游戏里一动不动。现在返回结果并打印，
+          启动时就能看出到底抢没抢到。
+        """
         try:
             import ctypes
-            from ctypes import wintypes
+            u32 = ctypes.windll.user32
+            if u32.GetForegroundWindow() == self.cap.hwnd:
+                return True
+            u32.ShowWindow(self.cap.hwnd, 9)               # SW_RESTORE
+            # Windows 有"前台锁定"：后台进程直接 SetForegroundWindow 常被拒绝。
+            # 先敲一下 Alt（keybd_event）能骗过它 —— 这是标准绕法。
+            u32.keybd_event(0x12, 0, 0, 0)
+            u32.SetForegroundWindow(self.cap.hwnd)
+            u32.keybd_event(0x12, 0, 2, 0)
+            time.sleep(0.15)
+            return u32.GetForegroundWindow() == self.cap.hwnd
+        except Exception as e:
+            print(f"[焦点] 抢焦点出错：{e!r}")
+            return False
+
+    def _ensure_focus(self) -> None:
+        """发键前确认模拟器在前台；丢焦点了就抢回来（最多每 0.5 秒检查一次）。
+
+        ★ 2026-10-16（用户："模型没去控制角色，一次都没有"）：
+          以前只在**启动时**抢一次焦点。你中途用鼠标点一下 PyCharm / 浏览器看日志，
+          模拟器就丢焦点了，此后所有按键都发给别的窗口 —— 游戏里一动不动，
+          但状态栏的"已发键"照样在涨（因为按键确实发出去了），所以极难发现。
+        """
+        now = time.time()
+        if now - getattr(self, "_focus_t", 0.0) < 0.5:
+            return
+        self._focus_t = now
+        try:
+            import ctypes
             u32 = ctypes.windll.user32
             if u32.GetForegroundWindow() != self.cap.hwnd:
-                u32.ShowWindow(self.cap.hwnd, 9)
-                u32.keybd_event(0x12, 0, 0, 0)
-                u32.SetForegroundWindow(self.cap.hwnd)
-                u32.keybd_event(0x12, 0, 2, 0)
+                if not getattr(self, "_focus_warned", False):
+                    self._focus_warned = True
+                    print("\n[焦点] 模拟器不在前台 —— 已自动切回。"
+                          "（跑起来之后**别用鼠标点别的窗口**；真要看日志，看控制台别看游戏窗口）")
+                self._focus_window()
         except Exception:
             pass
 
     def _send_key(self, label: str) -> None:
-        from pynput.keyboard import KeyCode
         # ★ 2026-10-15（用户要求"项目要能用于别的游戏"）：**优先用模型自带的按键表**
         #   （model_meta.json 里的 key_map，训练时按 games/<游戏>.py 写进去的）。
         #   于是不同游戏训出来的模型各按各的键；老模型没有这个字段才回退到 config.py。
         ch = (getattr(self, "key_map", None) or {}).get(str(label).upper()) \
             or key_for_label(label)
-        if ch is None or self.keyboard is None:
+        if ch is None:
             return
+        # ★ 2026-10-16：ADB 通道优先（如果开着）。它不需要焦点，也不需要按键映射。
+        if getattr(self, "sender", None) is not None:
+            if not self.sender.send(ch):
+                print(f"\n[ERR] ADB 发键失败（{ch}）—— 已失败 {self.sender.n_fail} 次，"
+                      f"检查 python tools\\测试发键.py --check")
+            return
+        if self.keyboard is None:
+            return
+        from pynput.keyboard import KeyCode
+        self._ensure_focus()
         try:
+            self.self_sends.append(time.time())      # 记下来，免得被当成"人按键"计入标定
+            if len(self.self_sends) > 64:
+                del self.self_sends[:-32]
             self.keyboard.press(KeyCode.from_char(ch))
             time.sleep(0.03)
             self.keyboard.release(KeyCode.from_char(ch))
@@ -420,8 +580,15 @@ class Player:
                 return None
             frames.append(f)
         x = to_video_tensor(np.stack(frames))
-        x = flatten_frames(self.transform(x)).unsqueeze(0)
-        return x.to(self.device)
+        x = flatten_frames(self.transform(x))
+        if getattr(self, "speed_input", False):
+            # ★ 与训练端（core/dataset.py）必须**一字不差**，否则量纲不一致等于喂噪声
+            import math
+            sp = float(self._live_speed())
+            z = min(math.log1p(max(0.0, sp)) / 4.6, 2.0)
+            x = torch.cat([x, torch.full((1, x.shape[-2], x.shape[-1]),
+                                         z, dtype=x.dtype)], dim=0)
+        return x.unsqueeze(0).to(self.device)
 
     # ------------------------------------------------------------------
     def _human_key(self, key) -> None:
@@ -434,14 +601,21 @@ class Player:
         elif name == "f8":
             self.playing = not self.playing
             print(f"\n[切换] {'继续' if self.playing else '暂停'}")
-        elif ch and ch.lower() in "wasd":
-            self.human_presses.append(time.time())
-            self.human_key_events.append((time.time(), ch.lower()))
+        elif ch and ch.lower() in getattr(self, "human_key_chars", set()):
+            # ★ 2026-10-16：程序自己用 Controller 发的键，Windows 的键盘钩子**同样能看到**，
+            #   会被当成"人按键"混进标定数据（阈值就围着模型自己的行为转，标不出东西）。
+            #   所以刚由我们自己发过键的 150ms 内不记。
+            t = time.time()
+            if self.self_sends and t - self.self_sends[-1] <= 0.15:
+                return
+            self.human_presses.append(t)
+            self.human_key_events.append((t, ch.lower()))
 
     def control_loop(self) -> None:
         args = self.args
         thr_default = float(self.thr.get("default", 0.85))
         status_t = time.time()
+        calib_t = time.time()
         while self.running:
             x = self._input_tensor()
             if x is None:
@@ -463,36 +637,51 @@ class Player:
             # ★ 2026-10-16（用户："让程序自己标定作为默认"）：正常玩的时候也记录
             #   （每帧一条 (时刻, 置信度, 预测类别)，40fps 下一分钟才 2400 条，开销可忽略），
             #   退出时用"人是否随后 200ms 内按键"来算最佳阈值并写 thresholds.json。
+            # ★ 2026-10-16（用户："模型没有去控制角色移动，一次都没有" —— **真正的原因**）：
+            #   上一版把"平时自动标定"默认打开，却在记完一条数据后直接 continue ——
+            #   于是**每次正式运行都在纯观察，一个键都不发**。
+            #   特征就是四个计数全是 0：发键 0 / 锁定拦截 0 / 低置信 0 / 预测不动(N) 0。
+            #   自动标定只是"顺便记数据"，绝不能跳过下面的控制逻辑。
             if args.calibrate or getattr(args, "auto_calib", True):
                 self.t_calib.append((now, conf, label))
-                if now - status_t > 2:
+                if now - calib_t > 2:
                     speed = self._live_speed()
                     print(f"\r[标定] 采样 {self.ticks}  当前 {label} {conf:.2f}  "
                           f"人按键 {len(self.human_presses)} 次  速度 {speed:.0f}px/s  ", end="")
-                    status_t = now
+                    calib_t = now
+            if args.calibrate:          # 只有 --calibrate（纯标定、不发键）才在这里收工
                 time.sleep(0.01)
                 continue
 
             if not self.playing:
                 time.sleep(0.005)
                 continue
-            # 全局最小间隔：防止同一瞬间连发（人手最快也就 150ms 左右）
-            if now - self.last_send < self.min_gap_s:
-                self.lockout_hits += 1
-                time.sleep(0.005)
-                continue
-            # 同方向锁定：覆盖换道动画，防止同一个键在动画里重复触发；
-            # 换个方向说明是新的决策，立刻放行（W->S 这种连按就靠这条）
-            if now < self.lockout_until.get(label, 0.0):
-                self.lockout_hits += 1
-                time.sleep(0.005)
-                continue
-
+            # ★ 2026-10-16：把「阈值 / N」的判断挪到两道闸门**前面**。
+            #   原来"最小间隔(80ms)"和"同方向锁定"检查在最前，40fps 下大量帧还没轮到判断
+            #   就被拦掉 —— 低置信 / N 的计数全被吃掉，日志长得像
+            #   "低置信 67 次、预测不动 281 次、锁定拦截 183 次"这种看不懂的组合。
+            #   顺序换成 阈值 -> N -> 最小间隔 -> 同方向锁定：**发键行为完全不变**，计数才有意义。
             thr = float(self.thr.get(label, thr_default))
             if conf < thr:
                 self.low_conf += 1
             elif label == "N":
-                pass                                  # N = 什么都不做
+                # ★ 2026-10-16（用户："为什么置信度超过阈值却没动"）：最常见的原因就是它 ——
+                #   模型预测「N = 什么都不做」，而且常常对 N 也很自信（0.9+）。
+                #   阈值只决定"敢不敢动"；N 这个类别本身就是"别动"，所以不是故障。
+                self.n_pred += 1
+            elif now - self.last_send < self.min_gap_s:
+                # 全局最小间隔：防止同一瞬间连发（人手最快也就 150ms 左右）
+                self.gap_hits += 1
+            elif now < self.lockout_until.get(label, 0.0):
+                # 同方向锁定：覆盖换道动画，防止同一个键在动画里重复触发；
+                # 换个方向说明是新的决策，立刻放行（W->S 这种连按就靠这条）
+                self.lockout_hits += 1
+            elif (getattr(self, "sender", None) is not None and self.sender.busy()):
+                # ★ 2026-11-05（用户："为什么感觉这个模型反应很慢"）：
+                #   adb 的 input swipe 每次约 190~280ms（要启动一个 Java 进程），
+                #   设备是串行执行的。上一条还没做完就又塞一条 -> 在 shell 里排队，
+                #   延迟越积越大、越跑越慢。这里直接跳过，下一帧模型会再判一次。
+                self.busy_hits += 1
             else:
                 if not args.dry_run:
                     self._send_key(label)
@@ -506,11 +695,20 @@ class Player:
             if time.time() - status_t > 1.0:
                 speed = self._live_speed()
                 what = "拟发键" if args.dry_run else "已发键"
+                _nx = ("  预测不动(N) %d" % self.n_pred) if self.n_pred else ""
+                _bz = ("  忙 %d" % self.busy_hits) if self.busy_hits else ""
                 print(f"\r[运行] 预测 {label} {conf:.2f}  {what} {self.sent}  "
-                      f"锁定拦截 {self.lockout_hits}  低置信 {self.low_conf}  "
-                      f"速度 {speed:.0f}px/s  ", end="")
+                      f"锁定 {self.lockout_hits} 间隔 {self.gap_hits} 低置信 {self.low_conf}{_nx}{_bz}  "
+                      f"帧龄 {self._frame_age_ms():.0f}ms  速度 {speed:.0f}px/s  ", end="")
                 status_t = time.time()
             time.sleep(0.005)
+
+    def _frame_age_ms(self) -> float:
+        """最新一帧的年龄（毫秒）。这是纯延迟：画面已经过去这么久才被模型看到。"""
+        rec = self.ring.latest(1)
+        if not rec:
+            return 0.0
+        return max(0.0, (time.time() - rec[-1][0]) * 1000.0)
 
     def _live_speed(self) -> float:
         rec = self.ring.latest(9)
@@ -558,6 +756,19 @@ class Player:
         if len(rows) < 200 or act.sum() < 20:
             print("       [跳过] 数据太少（帧 <200 或 人按键 <20 次）—— 不覆盖已有的 thresholds.json")
             print("              想认真标定就跑一轮： python 6_自动玩.py --calibrate")
+            return
+        # ★ 2026-10-16（用户："模型没有去控制角色移动，一次都没有"）：
+        #   标定搜索上限是 0.98、每类还会 +0.05（最多到 0.99）。模型 conf 常年 0.95~0.98，
+        #   一旦标定出 0.99，**几乎每一帧都会被"低置信丢弃"** —— 游戏里就是一动不动。
+        #   所以写盘前先算一下：按这个阈值到底有多少帧能发出去。太少就拒绝覆盖。
+        rate = float((conf >= round(best_t, 2)).mean())
+        print(f"       按建议阈值 {best_t:.2f}，标定数据里 {rate*100:.1f}% 的帧会发键")
+        if rate < 0.05:
+            print("       [拒绝] 这个阈值会把 "
+                  f"{(1-rate)*100:.0f}% 的帧全部丢掉 —— 游戏里会一动不动。")
+            print("              多半是标定时你不在操作（或没按键就录进来的帧太多）。")
+            print("              **不覆盖** thresholds.json；建议先跑一轮正常玩，或手动设")
+            print("              6_自动玩.py 开头的 CONF_THRESHOLD = 0.55")
             return
         out = {"default": round(best_t, 2)}
         for lab in self.labels:
@@ -815,8 +1026,24 @@ class Player:
         if self.args.calibrate or getattr(self.args, "auto_calib", True):
             self.report_calibration()
         what = "拟发键" if self.args.dry_run else "发键"
-        print(f"\n结束：{what} {self.sent} 次，被动作锁定拦下 {self.lockout_hits} 次，"
-              f"低置信丢弃 {self.low_conf} 次")
+        print(f"\n结束：{what} {self.sent} 次，同方向锁定挡下 {self.lockout_hits} 次，"
+              f"最小间隔挡下 {self.gap_hits} 次，设备忙跳过 {self.busy_hits} 次，"
+              f"低置信丢弃 {self.low_conf} 次，模型预测不动(N) {self.n_pred} 次")
+        if self.sent == 0 and self.ticks > 60 and not self.args.calibrate:
+            print("[提示] 一个键都没发出去。按这个顺序查：")
+            if self.n_pred > self.low_conf:
+                print("       · 模型一直在预测 N（不动）—— 阈值或模型的问题（见下面的提示）")
+            elif self.low_conf > 0:
+                print(f"       · 全是「低置信丢弃」{self.low_conf} 次 —— 阈值太高：试试 --conf 0.6")
+            elif self.lockout_hits > 0 or self.gap_hits > 0:
+                print(f"       · 全被闸门拦下了（同方向锁定 {self.lockout_hits} / 最小间隔 "
+                      f"{self.gap_hits}）—— 调大 --lockout-ms / --min-gap-ms")
+            else:
+                print("       · 决策分支根本没跑到 —— 检查 control_loop 里是不是有 continue 把它跳过了")
+        if self.n_pred > max(60, self.sent * 3):
+            print("[提示] 模型绝大多数时候都在输出 N（不动）—— 它太保守了：")
+            print("       · 想让它敢动：阈值调低（--conf 0.6）或重训时 --neg-ratio 0.5")
+            print("       · 若是「该动的时候也不动」，那是模型质量问题，补数据重训才是根治")
         if self.cam_on:
             print(f"    热力图共算了 {self._cam_done} 次")
         if self.video_path:
@@ -864,6 +1091,9 @@ def main() -> None:
                     help="训练结果目录。默认用本文件顶部 MODEL_DIR 里写死的那个；"
                          "命令行给这个参数可以临时覆盖（不影响代码里的值）")
     ap.add_argument("--dry-run", action="store_true", help="不发键，只打印预测")
+    ap.add_argument("--send", choices=["key", "adb"], default=None,
+                    help="发键通道：key=键盘注入（默认），adb=ADB 触摸滑动"
+                         "（不依赖窗口焦点和雷电按键映射）")
     ap.add_argument("--profile", default=None,
                     help="区域档案名：模型默认挑 gamer_ai/profiles/<名字>/runs/ 里最新的那个，"
                          "取景也用该档案的 geometry.json。不给就用当前档案")
@@ -904,6 +1134,9 @@ def main() -> None:
                          "用来补偿模型\"动作偏早\"的系统偏差。"
                          "注意会拖坏连按：实测 delay>50ms 时 WA/WS 这类快连按识别率从 95.9%% 掉到 65%%（delay=81）")
     # ---------------- 注意力热力图 + 录像 ----------------
+    ap.add_argument("--backend", choices=["printwindow", "bitblt"], default=None,
+                    help="抓帧后端。printwindow 慢（实测 35ms/帧）但能抓被遮挡的窗口；"
+                         "bitblt 快（10ms/帧）但要求模拟器窗口没被别的窗口挡住")
     ap.add_argument("--cam", dest="cam", action="store_true", default=True,
                     help="显示 Grad-CAM 实时热力图窗口（默认开启）")
     ap.add_argument("--no-cam", dest="cam", action="store_false",
@@ -956,11 +1189,26 @@ def main() -> None:
             print("\n   （这个位置还没有模型：先跑 4_训练.py）")
         return
 
-    # 没给 --run 时：档案里挑最新的模型（MODEL_DIR 只在没档案时才起作用）
-    if _prof and args.run == MODEL_DIR:
-        args.run = pick_run(quiet=True, root=_runs_root)
+    # ★ 2026-10-16（用户："为什么我改这里的模型不对路径不对"）：
+    #   旧逻辑是「只要档案可用，就**完全无视 MODEL_DIR**，去档案的 runs/ 里挑最新那个」。
+    #   于是你把 MODEL_DIR 改成 ..._1022，程序照样加载 ..._1122 —— 看起来就是"路径不生效"。
+    #   现在改成：**只要写了路径（顶上 MODEL_DIR 或命令行 --run）就它说了算**；
+    #   写 None 才自动挑最近的（有档案就在档案的 runs/ 里挑）。
+    if not args.run:
+        args.run = pick_run(quiet=True, root=_runs_root) if _prof else pick_run(quiet=True)
+        print(f"[模型] MODEL_DIR=None -> 自动挑最近产出的模型：{os.path.basename(args.run)}")
+    else:
+        print(f"[模型] 用你指定的模型：{args.run}")
     args.profile_name = _prof          # Player 里用它找档案的 geometry.json
     args.run = resolve_model_dir(args.run)
+    if _prof and _runs_root:
+        try:
+            if not os.path.normcase(os.path.abspath(args.run)).startswith(
+                    os.path.normcase(os.path.abspath(_runs_root))):
+                print(f"[模型] 注意：这个模型不在当前档案 {_prof} 的 runs/ 里 —— "
+                      f"取景会优先用模型自带 geometry，画面不对就改 MODEL_DIR 或加 --profile")
+        except Exception:
+            pass
     Player(args).run()
 
 

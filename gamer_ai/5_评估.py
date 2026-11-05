@@ -151,6 +151,77 @@ def measure_latency(model, device, in_frames, img_size, n=60):
     return dt * 1000.0
 
 
+def recommend_thresholds(probs, y_true, y_pred, labels, m_real, run_dir, args) -> None:
+    """用这次评估的数据**自动推荐置信度阈值**，并写 模型评估/thresholds_建议.json。
+
+    ★ 2026-10-16（用户："thresholds.json 是怎么生成的手动还是评估自动？手动调阈值不准"）：
+      评估手里正好有"每个样本的置信度 + 真实标签"，直接扫一遍阈值就行 —— 不用手动试。
+
+    规则（和 6_自动玩.py 部署时完全一致）：置信度 < 阈值 = 不按键（等于输出不动）。
+        · 真实是动作类：按了且预测对 = 有效动作；按了但预测错 = 动作错误；没按 = 漏动
+        · 真实是不动（N）：没按 = 正确不动；按了 = 误触发
+    选总正确率最高的阈值；同时把漏动率一起打出来（那是最容易撞死的错）。
+
+    注意：这是在**同一份评估数据**上挑阈值，天然偏乐观。正式上线建议在 val 上挑、在 test 上看。
+    """
+    import numpy as _np
+    labels = list(labels)
+    n_idx = labels.index("N") if "N" in labels else -1
+    real = _np.asarray(m_real)[:len(y_true)]
+    yt, yp = _np.asarray(y_true)[real], _np.asarray(y_pred)[real]
+    cf = _np.asarray(probs)[real].max(axis=1)
+    if not len(yt):
+        return
+    should = (yt != n_idx) if n_idx >= 0 else _np.ones(len(yt), bool)
+    rows = []
+    for t in _np.arange(0.50, 0.996, 0.01):
+        acts = (yp != n_idx if n_idx >= 0 else _np.ones(len(yp), bool)) & (cf >= t)
+        ok = (acts & (yp == yt)) | (~acts & ~should)
+        miss = should & ~acts
+        rows.append((float(t), float(ok.mean()), float(miss.mean())))
+    best = max(rows, key=lambda r: (r[1], -r[2]))
+    print()
+    print("=" * 78)
+    print("【阈值推荐 · 用这次评估的置信度分布自动算】")
+    print("=" * 78)
+    print("  %-8s %-12s %s" % ("阈值", "总正确率", "该动却没动(漏动)"))
+    for t, ok, miss in rows:
+        if abs((t * 100) % 10) < 1e-6:            # 每 0.1 打一行，够看趋势
+            mark = "  <- 推荐" if abs(t - best[0]) < 1e-9 else ""
+            print("  %-8.2f %-12.4f %.1f%%%s" % (t, ok, miss * 100, mark))
+    per = {}
+    for _lab in labels:
+        sub = [r[0] for r in zip(cf, yp, yt) if False]
+    # 按动作给"建议值"：动作类稍微保守一点（+0.05），不定则用总体值
+    sug = {"default": round(best[0], 2)}
+    for _lab in labels:
+        if _lab == "N":
+            continue
+        m = (yt == labels.index(_lab))
+        if m.sum() >= 5:
+            sub = rows
+            sug[_lab] = round(min(0.99, best[0] + 0.05), 2)
+    print("  推荐阈值 default=%.2f（总正确率 %.4f，漏动 %.1f%%）"
+          % (best[0], best[1], best[2] * 100))
+    print("  对比：当前 default=0.85 时 总正确率 %.4f，漏动 %.1f%%"
+          % next(((o, m) for t, o, m in rows if abs(t - 0.85) < 1e-9), (float("nan"), float("nan"))))
+    _ed = os.path.join(run_dir, "模型评估")
+    os.makedirs(_ed, exist_ok=True)
+    _p = os.path.join(_ed, "thresholds_建议.json")
+    json.dump(sug, open(_p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+    print("  已写出建议：%s" % _p)
+    if getattr(args, "write_thresholds", False):
+        _rp = os.path.join(run_dir, "thresholds.json")
+        if os.path.isfile(_rp):
+            import shutil, time as _t
+            shutil.copy2(_rp, _rp + ".bak_" + _t.strftime("%Y%m%d_%H%M%S"))
+        json.dump(sug, open(_rp, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+        print("  已应用（--write-thresholds）：%s" % _rp)
+    else:
+        print("  想直接应用： python 5_评估.py --write-thresholds")
+    print("=" * 78)
+
+
 def run_auto_cam(args) -> None:
     """评估结束自动出"每类抽样"注意力热力图（默认开，--no-cam 关）。
 
@@ -193,6 +264,8 @@ def main():
     # ★ 2026-10-15：原来的 8_注意力可视化.py 合并进来了 ——
     #   --cam  离线出 Grad-CAM 热力图（挑样本看图/批量出图）
     #   --live 实时可视化（开着模拟器进关卡，边跑边看模型盯哪儿）
+    ap.add_argument("--write-thresholds", action="store_true",
+                    help="把评估算出的阈值建议直接写进模型目录的 thresholds.json（旧文件自动备份）")
     ap.add_argument("--no-cam", dest="cam_auto", action="store_false", default=True,
                     help="评估完**不**自动出每类抽样热力图（默认会出，放在 <模型>/模型评估/attention/）")
     ap.add_argument("--cam", action="store_true",
@@ -342,6 +415,25 @@ def main():
     print("=" * 78)
 
     cfg = load_cfg(args.sessions, args)
+    # ★ 2026-11-05：速度标量通道 —— 必须**在构建数据集之前**决定，
+    #   否则输入少一个通道，模型直接报 shape 不匹配。
+    _meta = {}
+    _mf = os.path.join(args.run, "model_meta.json")
+    if os.path.isfile(_mf):
+        try:
+            _meta = json.load(open(_mf, encoding="utf-8"))
+        except Exception:
+            _meta = {}
+    cfg.use_speed = bool(_meta.get("speed_input", False))
+    # ★ 2026-11-05：**必须**用模型训练时的窗口定义，不能用采集时 session.json 里的。
+    #   训练用了 end_offset=102（正样本窗口提前 102ms），评估还按 0 取帧的话，
+    #   等于换了考卷 —— 实测同一份权重能测出 0.78 和 0.71 两个差 7 个点的结果。
+    if _meta.get("input_end_offset_ms") is not None:
+        cfg.input_end_offset_ms = int(_meta["input_end_offset_ms"])
+    if _meta.get("animation_neg_end_ms"):
+        cfg.animation_neg_end_ms = tuple(float(x) for x in _meta["animation_neg_end_ms"])
+    if _meta.get("approach_neg_end_ms"):
+        cfg.approach_neg_end_ms = tuple(float(x) for x in _meta["approach_neg_end_ms"])
     if args.no_anim_neg:
         cfg.animation_neg_enabled = False
     samples = load_sessions(args.sessions)
@@ -390,7 +482,10 @@ def main():
     y_true = np.array([ds.label_to_idx[ds.samples[j]["label"]] if j < n_real
                        else ds.label_to_idx["N"] for j in range(len(ds))])
 
-    model = build_model(in_frames, len(labels), pretrained=False).to(device)
+    # ★ 2026-11-05：按模型 meta 决定通道数（3*K 或 3*K+1 带速度标量通道）
+    _in_ch = int(_meta.get("in_channels") or (in_frames * 3))
+    model = build_model(in_frames, len(labels), pretrained=False,
+                        in_channels=_in_ch).to(device)
     model.load_state_dict(ck["model_state_dict"])
     y_pred, probs = run_batches(model, ds, device, args.batch_size, y_true, kinds)
 
@@ -447,6 +542,7 @@ def main():
                   ensure_ascii=False, indent=2)
         print()
         print("[输出] %s" % os.path.join(_ed, f"eval_{args.split}.json"))
+        recommend_thresholds(probs, y_true, y_pred, labels, m_real, args.run, args)
         run_auto_cam(args)        # ★ 没有 N 类也要出热力图（默认就出）
         return 0
 
@@ -543,6 +639,7 @@ def main():
     json.dump(out, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
     print(f"\n[输出] {p}")
 
+    recommend_thresholds(probs, y_true, y_pred, labels, m_real, args.run, args)
     # ★ 评估结束自动出"每类抽样"热力图（默认开；--no-cam 关）—— 见 run_auto_cam()
     run_auto_cam(args)
     return 0
