@@ -51,7 +51,9 @@ def load_model(run_dir):
     labels = list(meta["labels"])
     K, SZ = int(meta["in_frames"]), int(meta.get("img_size", 224))
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    model = build_model(K, len(labels), pretrained=False)
+    # ★ 2026-11-05：新模型可能是 3*K+1 通道（带速度标量），必须按 meta 建
+    model = build_model(K, len(labels), pretrained=False,
+                        in_channels=meta.get("in_channels"))
     ck = torch.load(os.path.join(run_dir, "best.pt"), map_location="cpu")
     model.load_state_dict(ck.get("model_state_dict", ck))
     model.to(dev).eval()
@@ -118,7 +120,15 @@ def main() -> int:
             if times[-1] < o or times[0] > o:
                 continue
             idx = D.select_window_indices(m, K, 1, float(o))
-            xs.append(D.flatten_frames(tf(D.to_video_tensor(D.read_strip(m, idx)))))
+            x1 = D.flatten_frames(tf(D.to_video_tensor(D.read_strip(m, idx))))
+            if meta.get("speed_input"):
+                # 与 core/dataset.py 完全一致：z = log1p(speed_px_s)/4.6，整图填同一个值
+                import math
+                _sp = float(m.get("speed_px_s") or 0.0)
+                _z = min(math.log1p(max(0.0, _sp)) / 4.6, 2.0)
+                x1 = torch.cat([x1, torch.full((1, x1.shape[-2], x1.shape[-1]),
+                                               _z, dtype=x1.dtype)], dim=0)
+            xs.append(x1)
             used.append(float(o))
         if not xs:
             continue

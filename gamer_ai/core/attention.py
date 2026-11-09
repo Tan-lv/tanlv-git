@@ -87,11 +87,16 @@ class AttentionProbe:
             cam -= cam.min()
             cam /= (cam.max() + 1e-8)
 
-        g = x.grad.detach().abs()                                   # (1, 3K, H, W)
-        h, w = g.shape[-2:]
-        per_frame = g.view(1, self.frames, 3, h, w).mean(dim=(2, 3, 4))[0]
+        g = x.grad.detach().abs()                                   # (1, 3K[+1], H, W)
+        # ★ 2026-11-05：输入可能多一个**速度标量通道**（3K+1）。原来这里直接
+        #   view(1, K, 3, H, W)，通道数不是 3K 时直接崩，热力图线程静默失败、
+        #   窗口永远显示"热力图计算中..."。现在只取前 3K 个画面通道。
+        n_img = 3 * self.frames
+        g_img = g[:, :n_img]
+        h, w = g_img.shape[-2:]
+        per_frame = g_img.view(1, self.frames, 3, h, w).mean(dim=(2, 3, 4))[0]
         per_frame = (per_frame / (per_frame.sum() + 1e-8)).cpu().numpy()
-        sal = g[0].mean(0).cpu().numpy()
+        sal = g_img[0].mean(0).cpu().numpy()
         sal = cv2.GaussianBlur(sal, (0, 0), 2.0)      # 平滑一下，否则全是噪点
         hi = float(np.percentile(sal, 99))            # 按 99 分位归一，避免被单个亮点拉爆
         sal = np.clip(sal / (hi + 1e-8), 0.0, 1.0)

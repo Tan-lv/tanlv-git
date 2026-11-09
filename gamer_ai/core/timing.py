@@ -112,7 +112,18 @@ def main(argv=None) -> int:
         print("[data] 跳过模型未训练的类别 %s，共 %d 个样本"
               % (dict(sorted(_C(_miss).items())), len(_miss)))
         samples = [s for s in samples if s["label"] in labels]
-    model = build_model(K, len(labels), pretrained=False).to(device)
+    # ★ 2026-11-05：新模型可能带速度标量通道（3*K+1），通道数以 model_meta.json 为准。
+    #   注意：下面 prob() 的形参也叫 meta（那是**样本**），所以这里用 _model_meta 区分。
+    _model_meta = {}
+    _mf = os.path.join(args.run, "model_meta.json")
+    if os.path.isfile(_mf):
+        import json as _json
+        try:
+            _model_meta = _json.load(open(_mf, encoding="utf-8"))
+        except Exception:
+            _model_meta = {}
+    model = build_model(K, len(labels), pretrained=False,
+                        in_channels=_model_meta.get("in_channels")).to(device)
     model.load_state_dict(ck["model_state_dict"])
     model.eval()
     tf = build_eval_transform(args.img_size)
@@ -129,7 +140,11 @@ def main(argv=None) -> int:
 
     def prob(meta, end_ms):
         idx = select_window_indices(meta, K, cfg.input_stride, end_ms)
-        x = flatten_frames(tf(to_video_tensor(read_strip(meta, idx)))).unsqueeze(0).to(device)
+        x = flatten_frames(tf(to_video_tensor(read_strip(meta, idx))))
+        if _model_meta.get("speed_input"):
+            from .dataset import append_speed_channel as _asc
+            x = _asc(x, meta.get("speed_px_s"))
+        x = x.unsqueeze(0).to(device)
         with torch.no_grad():
             return torch.softmax(model(x).float(), dim=1)[0].cpu().numpy()
 

@@ -165,7 +165,12 @@ def build_animation_negatives(all_samples: Sequence[dict], cfg: Config,
     if not ends:
         return []
     need_ms = max(ends)
-    key_idx = [i for i, m in enumerate(all_samples) if m["label"] != "N"]
+    # ★ 2026-11-05（用户："按键 N 收集的数据要和 AWSD 一样取正和负数据"）：
+    #   cfg.n_as_anchor=True 时，N 按键也当锚点 —— N 按下那一刻之后的那几个窗口
+    #   同样会生成 N 样本（对 N 来说"之后的窗口"就是普通跑动画面，标 N 是对的）。
+    _allow_n = bool(getattr(cfg, "n_as_anchor", False))
+    key_idx = [i for i, m in enumerate(all_samples)
+               if (m["label"] != "N" or _allow_n)]
     anchors = sorted(all_samples[i]["t_anchor"] for i in key_idx)
     out: List[Tuple[int, float]] = []
     for i in key_idx:
@@ -232,7 +237,10 @@ def build_approach_negatives(all_samples: Sequence[dict], cfg: Config,
     if not ends:
         return []
     margin = float(getattr(cfg, "approach_neg_quiet_margin_ms", 250))
-    key_idx = [i for i, m in enumerate(all_samples) if m["label"] != "N"]
+    # ★ 2026-11-05：同上，允许 N 当锚点（"我主动什么都没做"正是最好的"障碍还远"锚点）
+    _allow_n = bool(getattr(cfg, "n_as_anchor", False))
+    key_idx = [i for i, m in enumerate(all_samples)
+               if (m["label"] != "N" or _allow_n)]
     anchors = sorted(all_samples[i]["t_anchor"] for i in key_idx)
     out: List[Tuple[int, float]] = []
     for i in key_idx:
@@ -290,6 +298,7 @@ def negative_breakdown(all_samples: Sequence[dict], split_idx: Sequence[int],
 #    现在 8 workers x 3 条 = 190MB，安全。
 _STRIP_CACHE: "OrderedDict[str, np.ndarray]" = OrderedDict()
 _STRIP_CACHE_MAX = 3
+_SHORT_STRIP_WARNED = set()      # 已经提示过"胶片条偏短"的文件，避免刷屏
 
 
 def clear_strip_cache() -> None:
@@ -310,9 +319,26 @@ def read_strip(meta: dict, indices: Sequence[int]) -> np.ndarray:
     else:
         _STRIP_CACHE.move_to_end(path)
     out = np.empty((len(indices), fh, fw, 3), dtype=np.uint8)
+    # ★ 2026-11-08（用户训练崩在评估：ValueError: could not broadcast ... (293,0,3)）：
+    #   极少数样本的胶片条比 meta 记录的帧数少 1~4 帧（采集时写盘被中断，实测 10507 个里 3 个）。
+    #   原来 img[0:fh, x:x+fw] 在越界时会取到**宽度 0** 的切片，直接 broadcast 报错，
+    #   把整轮训练/评估搞崩。现在把越界下标夹到最后一帧，必要时补零。
+    n_avail = max(1, (img.shape[1] - sep) // (fw + sep) + 1) if img.shape[1] >= fw else 1
     for j, i in enumerate(indices):
-        x = i * (fw + sep)
-        out[j] = img[0:fh, x:x + fw]
+        ii = min(max(0, int(i)), n_avail - 1)
+        x = ii * (fw + sep)
+        patch = img[0:fh, x:x + fw]
+        if patch.shape[0] != fh or patch.shape[1] != fw:
+            if path not in _SHORT_STRIP_WARNED:
+                _SHORT_STRIP_WARNED.add(path)
+                print("[data] 胶片条比 meta 记录的短，已夹到最后一帧：%s（条内 %d 帧）"
+                      % (os.path.basename(path), n_avail))
+            full = np.zeros((fh, fw, 3), dtype=np.uint8)
+            hh, ww = min(fh, patch.shape[0]), min(fw, patch.shape[1])
+            if hh > 0 and ww > 0:
+                full[:hh, :ww] = patch[:hh, :ww]
+            patch = full
+        out[j] = patch
     return out
 
 
@@ -363,6 +389,43 @@ def flatten_frames(x: torch.Tensor) -> torch.Tensor:
     """(K,3,H,W) -> (K*3,H,W) 通道维堆叠（早融合）"""
     k, c, h, w = x.shape
     return x.reshape(k * c, h, w)
+
+
+# ======================================================================
+#  输入构建的共用工具（2026-11-05）
+#  ★ 为什么抽出来：模型可能是 3*K 通道，也可能是 3*K+1（多一个速度标量通道）。
+#    以前每个脚本（6_自动玩 / 7_迭代采集 / 5_评估 / attention_report / timing /
+#    对比模型）都自己写一遍"取帧 -> 变换 -> flatten"，加通道时得改 5 个地方，
+#    漏一个就在运行时崩（热力图"永远计算中"就是这么来的）。
+# ======================================================================
+def meta_in_channels(meta: dict) -> int:
+    """模型要几个输入通道：优先用 meta 记的，老模型没有这个字段就按 3*K 算。"""
+    return int(meta.get("in_channels") or (int(meta["in_frames"]) * 3))
+
+
+def speed_to_z(speed_px_s) -> float:
+    """速度 -> 归一化标量。训练、部署、评估**必须**用同一个公式。"""
+    import math
+    return min(math.log1p(max(0.0, float(speed_px_s or 0.0))) / 4.6, 2.0)
+
+
+def append_speed_channel(x, speed_px_s):
+    """给 (C,H,W) 张量追加一个"整图填同一个值"的速度通道。"""
+    import torch as _t
+    z = speed_to_z(speed_px_s)
+    return _t.cat([x, _t.full((1, x.shape[-2], x.shape[-1]), z, dtype=x.dtype)], dim=0)
+
+
+def build_input(sample: dict, end_ms: float, transform, meta: dict,
+                stride: int = None):
+    """从一条样本记录建模型输入张量 (C,H,W)。end_ms 为窗口结束时间（相对按键）。"""
+    k = int(meta["in_frames"])
+    st = int(stride if stride is not None else meta.get("input_stride", 1))
+    idx = select_window_indices(sample, k, st, float(end_ms))
+    x = flatten_frames(transform(to_video_tensor(read_strip(sample, idx))))
+    if meta.get("speed_input"):
+        x = append_speed_channel(x, sample.get("speed_px_s"))
+    return x
 
 
 # ======================================================================

@@ -129,6 +129,13 @@ def parse_args(argv=None):
                    help="用哪个指标选 best.pt / 早停（默认 macro_f1：五类等权，"
                         "不会被海量合成 N 负样本骗到；acc = 老行为）")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--n-anchor-ratio", type=float, default=0.3,
+                   help="--n-as-anchor 时，「N 按键派生」的样本在 --neg-ratio 封顶之外"
+                        "**额外**加多少：上限 = 正样本数 x 这个比例（默认 0.3）")
+    p.add_argument("--n-as-anchor", action="store_true", default=False,
+                   help="N 按键也当负样本锚点（用户要求：N 也和 AWSD 一样取'按下那一刻 + "
+                        "周围窗口'）。多出来的 N 只用来填补 --neg-ratio 的空余名额，"
+                        "不会挤掉治 AA/DD 的'换道动画'负样本")
     p.add_argument("--mirror-ad", type=float, default=0.5,
                    help="A/D 左右镜像**互换**的概率（默认 0.5 = 每个 A/D 样本有一半概率"
                         "水平翻转并把标签 A<->D 对调）。0 = 关闭。只作用于训练集。")
@@ -219,6 +226,8 @@ def build_cfg(session_dirs, args) -> Config:
         cfg.frame_w = args.frame_w
     # ★ 速度标量通道（2026-11-05）：输入通道从 3*K 变成 3*K+1
     cfg.use_speed = bool(getattr(args, "speed_input", True))
+    # ★ N 按键是否也当负样本锚点（用户要求：N 和 AWSD 一样取正和负）
+    cfg.n_as_anchor = bool(getattr(args, "n_as_anchor", False))
     cfg.validate()
     return cfg
 
@@ -507,9 +516,29 @@ def train(argv=None) -> int:
             cfg.animation_neg_enabled = True
             log("[neg] 「换道动画中」偏移被参数覆盖（TRAIN 里的 anim_neg_ms 或命令行 "
                 "--anim-neg-ms）：%s ms" % list(_ms))
+    # ★ 2026-11-05（用户："按键 N 收集的数据要和 AWSD 一样取正和负数据"）：
+    #   分两趟算负样本，保证**优先级**：
+    #     第一趟：只拿动作锚点（A/D/S/W/G/Q）算 —— 这批是治 AA/DD、治动作偏早的核心
+    #     第二趟：把 N 按键也当锚点再算一遍，差集就是"N 按键派生"的那部分
+    #   截断时 N 派生的**只填空余名额**，绝不会把第一趟的挤掉。
+    _want_n_anchor = bool(getattr(cfg, "n_as_anchor", False))
+    cfg.n_as_anchor = False
     neg_tr = negatives_for_subset(samples, sp["train"], cfg, labels)
     neg_va = negatives_for_subset(samples, sp["val"], cfg, labels)
     neg_te = negatives_for_subset(samples, sp["test"], cfg, labels)
+    _n_extra = {"train": [], "val": [], "test": []}
+    if _want_n_anchor:
+        cfg.n_as_anchor = True
+        _all_n = {k: negatives_for_subset(samples, sp[k], cfg, labels)
+                  for k in ("train", "val", "test")}
+        cfg.n_as_anchor = False
+        for _k, _base in (("train", neg_tr), ("val", neg_va), ("test", neg_te)):
+            _seen = set(_base)
+            _n_extra[_k] = [x for x in _all_n[_k] if x not in _seen]
+        log("[neg] N 按键也当锚点：额外多出 %d 个 N 窗口"
+            "（train %d / val %d / test %d）—— 在 --neg-ratio 封顶之外额外加入"
+            % (sum(len(v) for v in _n_extra.values()), len(_n_extra["train"]),
+               len(_n_extra["val"]), len(_n_extra["test"])))
     # 负样本数量随数据集线性膨胀（这次占全部训练条目的 71%）。太多有两个害处：
     #   ① 每轮要读的胶片条翻几倍 -> 训练慢；
     #   ② 模型被大量「什么都不做」压得太保守，该换道时也不敢动。
@@ -548,12 +577,31 @@ def train(argv=None) -> int:
             elif _cur:
                 log(f"[neg] {_nm} 负样本 {len(_cur)}（正样本 {_npos}，"
                     f"未超上限 {_cap} = {_npos} x {args.neg_ratio}）")
+            # ★ 2026-11-05（用户要求"N 也和 AWSD 一样取正和负"）：
+            #   N 按键派生的样本**在 --neg-ratio 封顶之外额外加**，自己的上限是
+            #   正样本数 x --n-anchor-ratio（默认 0.3）。
+            #   之前先试过"只填空余名额"，结果动作锚点早就顶满上限 -> 一个都加不进来。
+            if _n_extra[_nm]:
+                _pool = _n_extra[_nm]
+                _extra_cap = int(_npos * max(0.0, args.n_anchor_ratio))
+                if _extra_cap > 0:
+                    _add = (_rng.sample(_pool, min(len(_pool), _extra_cap))
+                            if len(_pool) > _extra_cap else list(_pool))
+                    if _add:
+                        _cur = _cur + _add
+                        log(f"[neg] {_nm} 额外加入「N 按键派生」{len(_add)} 个"
+                            f"（上限 = 正样本 {_npos} x --n-anchor-ratio "
+                            f"{args.n_anchor_ratio}；可用 {len(_pool)}）")
             _capped.append(_cur)
         neg_tr, neg_va, neg_te = _capped
         _n_tr = len(sp["train"]) + len(neg_tr)
         if _n_tr:
             log(f"[neg] 训练条目 {_n_tr} = 正样本 {len(sp['train'])}"
                 f" + 负样本 {len(neg_tr)}；负样本占 {100.0*len(neg_tr)/_n_tr:.0f}%")
+    if args.neg_ratio <= 0 and _want_n_anchor:
+        neg_tr = neg_tr + _n_extra["train"]
+        neg_va = neg_va + _n_extra["val"]
+        neg_te = neg_te + _n_extra["test"]
     if "N" in labels:
         bd = {k: negative_breakdown(samples, sp[k], cfg, labels)
               for k in ("train", "val", "test")}
@@ -812,6 +860,10 @@ def train(argv=None) -> int:
     n_batches = len(train_loader)
     log(f"[train] 每轮 {len(train_ds)} 个条目 = {n_batches} 批，batch={args.batch_size}；"
         f"下面每 5 秒刷一次进度。第一轮前面那段是最慢的，别以为卡死了。")
+    # ★ 2026-11-08：start_epoch >= epochs 时（例如 --resume 一个已经训完的模型、只想重跑评估），
+    #   下面的 torch.save 会用到 epoch/va_acc/va_f1 —— 循环一次都没跑就 UnboundLocalError。
+    epoch = None
+    va_acc = va_f1 = 0.0
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
         model.train()
@@ -897,12 +949,13 @@ def train(argv=None) -> int:
     #   5_评估.py 读 best.pt 时正是因此报 KeyError: 'in_frames'，
     #   而 metrics.json 里那些"用 best.pt 评估"的数字其实评的是最后一轮。
     #   现在存成 last.pt：best.pt 名副其实（最优轮），最后一轮另存一份备用。
-    torch.save({"model_state_dict": model.state_dict(),
-                "optimizer_state_dict": opt.state_dict(),
-                "epoch": epoch, "val_acc": va_acc, "val_f1": va_f1,
-                "select_metric": args.select_metric, "labels": labels,
-                "arch": "efficientnet_b0", "in_frames": cfg.input_frames,
-                "config": cfg.to_dict()}, os.path.join(args.out, "last.pt"))
+    if epoch is not None:      # 循环一次都没跑（纯重跑评估）就别把 last.pt 覆盖掉
+        torch.save({"model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": opt.state_dict(),
+                    "epoch": epoch, "val_acc": va_acc, "val_f1": va_f1,
+                    "select_metric": args.select_metric, "labels": labels,
+                    "arch": "efficientnet_b0", "in_frames": cfg.input_frames,
+                    "config": cfg.to_dict()}, os.path.join(args.out, "last.pt"))
 
     # ---------- 测试集 ----------
     log("\n" + "=" * 78)
@@ -1045,13 +1098,20 @@ def train(argv=None) -> int:
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         h = np.array(history)
-        fig, ax = plt.subplots(1, 2, figsize=(12, 4))
-        ax[0].plot(h[:, 0], h[:, 1], label="train"); ax[0].plot(h[:, 0], h[:, 3], label="val")
-        ax[0].set_title("Loss"); ax[0].set_xlabel("epoch"); ax[0].legend()
-        ax[1].plot(h[:, 0], h[:, 2], label="train"); ax[1].plot(h[:, 0], h[:, 4], label="val")
-        ax[1].set_title("Accuracy"); ax[1].set_xlabel("epoch"); ax[1].legend()
-        plt.tight_layout(); plt.savefig(os.path.join(args.out, "curves.png"), dpi=150)
-        log("[输出] curves.png")
+        # ★ 2026-11-08：--resume 一个已经训完的模型时循环一次都不跑，history 是空的，
+        #   np.array([]) 是 1 维数组，h[:, 0] 会抛
+        #   IndexError: too many indices for array: array is 1-dimensional。
+        #   （这个异常发生在 model_meta.json 写完之后，所以模型本身没事，只是退出码变成 1。）
+        if h.ndim != 2 or h.shape[0] == 0:
+            log("[输出] 跳过 curves.png（本次没有训练轮次，history 为空）")
+        else:
+            fig, ax = plt.subplots(1, 2, figsize=(12, 4))
+            ax[0].plot(h[:, 0], h[:, 1], label="train"); ax[0].plot(h[:, 0], h[:, 3], label="val")
+            ax[0].set_title("Loss"); ax[0].set_xlabel("epoch"); ax[0].legend()
+            ax[1].plot(h[:, 0], h[:, 2], label="train"); ax[1].plot(h[:, 0], h[:, 4], label="val")
+            ax[1].set_title("Accuracy"); ax[1].set_xlabel("epoch"); ax[1].legend()
+            plt.tight_layout(); plt.savefig(os.path.join(args.out, "curves.png"), dpi=150)
+            log("[输出] curves.png")
     except ImportError:
         log("[提示] 没装 matplotlib，跳过曲线图（history.csv 里有全部数据）")
 

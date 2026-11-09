@@ -131,6 +131,32 @@ MIN_GAP_MS = 80
 #  延迟取帧（毫秒）：让模型看"现在-delay"时刻的画面，补偿"动作偏早"。别超过 50
 DELAY_MS = 0
 
+# ==============================================================================
+#  ★ 热力图（Grad-CAM）开关 —— 默认 **关**
+#
+#  为什么默认关：热力图不是"顺手画一下"，它是**第二份 FP32 模型 + 一次反向传播**，
+#  实测每次约 80ms，而控制模型前向只要 32ms。默认每 4 帧算一次 = 每秒 10 次
+#  = 吃掉 GPU 的 80%，和控制循环抢同一块卡 —— 判帧频率会从 ~20 次/秒掉到 ~11 次/秒，
+#  表现出来就是"开了热力窗之后识别变慢、动作变迟钝"。
+#
+#  想看图的时候再开：命令行加 --cam（或把这里改成 True）
+#  只想省 GPU、不画图但保留窗口里的状态文字：保持 False，窗口照样开
+#  连窗口也不要：保持下面的 SHOW_WINDOW = False（现在就是）
+# ==============================================================================
+CAM_HEATMAP = False
+
+# ==============================================================================
+#  ★ 要不要弹那个"画面 + 状态文字"的窗口 —— 默认 **不弹**
+#
+#  窗口本身也要钱：它按 20fps 把画面放大两倍、叠中文文字（PIL 渲染，很吃 CPU）、
+#  再 cv2.imshow，和抓帧/推理抢同一个 CPU 核。
+#
+#  不看画面时保持 False（现在就是）：控制台每秒仍会打印
+#       [运行] 预测 X 0.93  已发键 N  锁定 N  帧龄 40ms  速度 80px/s
+#  想看画面：命令行加 --cam-window（或把这里改成 True）
+# ==============================================================================
+SHOW_WINDOW = False
+
 
 import argparse
 import json
@@ -365,6 +391,13 @@ class Player:
         self.cam_on = bool(getattr(args, "cam", True))
         self.cam_every = max(1, int(getattr(args, "cam_every", 4)))
         self.cam_window = bool(getattr(args, "cam_window", True))
+        # ★ 只在"模型判断发生变化"时重算热力图（外加每 N 秒兜底刷一次）：
+        #   大部分时间模型都在输出 N，没必要每秒算 8 次。
+        self.cam_on_change = bool(getattr(args, "cam_on_change", False))
+        self.cam_force_s = float(getattr(args, "cam_force_s", 2.0))
+        self._cam_last_lab = None
+        self._cam_last_t = 0.0
+        self._cam_label_now = None
         self.cam_probe = None
         self.cam_model = None
         self._cam_lock = threading.Lock()
@@ -373,6 +406,7 @@ class Player:
         self._cam_info = None        # (预测类别, 置信度, 逐帧重要度)
         self._last_full = None       # 抓帧线程最新一帧完整裁剪画面 (RGB)
         self._cam_done = 0
+        self._cam_err = None         # 热力图线程的失败原因（显示在窗口上）
         self._display_done = threading.Event()
         self.video_path = None
         self._video_frames = 0
@@ -382,8 +416,16 @@ class Player:
             self.cam_model.load_state_dict(ck.get("model_state_dict", ck))
             self.cam_model = self.cam_model.to(self.device).eval().float()
             self.cam_probe = AttentionProbe(self.cam_model, frames=self.K)
-            print(f"[cam] 热力图开启：另一份 FP32 模型，每 {self.cam_every} 帧算一次"
-                  f"（约 {40.0/self.cam_every:.0f}Hz）；控制循环不受影响")
+            # ★ 2026-11-05（用户："开热力窗后识别速度变慢"）：别再说"控制循环不受影响"，
+            #   那是错的。热力图是**另一份 FP32 模型 + 反向传播**，实测每次约 80ms
+            #   （控制模型前向只要 32ms），而且和控制循环抢同一块 GPU。
+            _hz = 40.0 / self.cam_every
+            _duty = _hz * 0.080
+            print(f"[cam] 热力图开启：另一份 FP32 模型 + 反向传播，每次约 80ms，"
+                  f"每 {self.cam_every} 帧一次（约 {_hz:.0f}Hz）"
+                  f" -> 约占 GPU {_duty*100:.0f}%，判帧频率会明显下降")
+            print(f"       想快一点：--cam-every 20（约 2Hz）或 --no-cam（只看预测不画热力图）"
+                  if self.cam_every < 20 else "       当前频率已经很低，影响很小")
         self.delay_s = max(0.0, getattr(args, "delay_ms", 0)) / 1000.0
         if self.delay_s > 0:
             print(f"[delay] 延迟取帧 {self.delay_s*1000:.0f}ms —— 动作会比模型自己的判断晚这么多")
@@ -631,6 +673,8 @@ class Player:
                 prob = F.softmax(out.float(), dim=1)[0]
             conf, idx = float(prob.max()), int(prob.argmax())
             label = self.labels[idx]
+            if self.cam_on:
+                self._cam_label_now = label        # 供 --cam-on-change 判断要不要重算
             self.ticks += 1
             now = time.time()
 
@@ -864,6 +908,13 @@ class Player:
                 time.sleep(min(0.01, next_t - now))
                 continue
             next_t = now + interval
+            # 只在判断变了（或超过兜底间隔）时才重算 —— 稳态下几乎不占 GPU
+            if self.cam_on_change:
+                _lab = self._cam_label_now
+                if (_lab is not None and _lab == self._cam_last_lab
+                        and (now - self._cam_last_t) < self.cam_force_s):
+                    time.sleep(0.02)
+                    continue
             with self._cam_lock:
                 x = self._cam_in
             if x is None:
@@ -878,8 +929,13 @@ class Player:
                                       float(res["prob"][res["pred"]]),
                                       res["frame_importance"])
                 self._cam_done += 1
+                self._cam_last_lab = self._cam_label_now
+                self._cam_last_t = time.time()
             except Exception as e:
-                print(f"\n[cam] 热力图计算失败: {e}")
+                msg = f"{type(e).__name__}: {e}"
+                if getattr(self, "_cam_err", None) != msg:
+                    print(f"\n[cam] 热力图计算失败: {msg}")
+                    self._cam_err = msg          # 同步显示到窗口上，避免"永远计算中"
                 time.sleep(0.5)
 
     def _display_loop(self) -> None:
@@ -944,8 +1000,13 @@ class Player:
 
             # ---- 叠加状态文字 ----
             # 注意：中文必须用 put_text_cn —— cv2.putText 只认 ASCII，中文会变方块
-            put_text_cn(base, "热力图" if cm is not None else "热力图计算中...", (8, 4),
-                        size=20, color=(0, 255, 255) if cm is not None else (170, 170, 170))
+            if cm is not None:
+                _title, _color = "热力图", (0, 255, 255)
+            elif getattr(self, "_cam_err", None):
+                _title, _color = ("热力图失败：" + self._cam_err)[:60], (80, 80, 255)
+            else:
+                _title, _color = "热力图计算中...", (170, 170, 170)
+            put_text_cn(base, _title, (8, 4), size=20, color=_color)
             if info is not None:
                 lab, conf, imp = info
                 put_text_cn(base, f"模型判断 {lab}  置信度 {conf:.2f}", (8, 30),
@@ -992,7 +1053,9 @@ class Player:
                   f"   窗口 {'开' if self.cam_window else '关'}"
                   f"   录像 {'关' if getattr(self.args, 'no_video', False) else '开'}")
         else:
-            print("热力图: 关闭（--cam 可打开）")
+            print("热力图: 关闭（--cam 可打开）"
+                  + ("    窗口: 关（--cam-window 可打开）" if not self.cam_window
+                     else "    窗口: 开"))
         print("=" * 78)
         if not self.args.calibrate and not self.args.dry_run:
             for i in (3, 2, 1):
@@ -1137,15 +1200,25 @@ def main() -> None:
     ap.add_argument("--backend", choices=["printwindow", "bitblt"], default=None,
                     help="抓帧后端。printwindow 慢（实测 35ms/帧）但能抓被遮挡的窗口；"
                          "bitblt 快（10ms/帧）但要求模拟器窗口没被别的窗口挡住")
-    ap.add_argument("--cam", dest="cam", action="store_true", default=True,
+    ap.add_argument("--cam", dest="cam", action="store_true", default=CAM_HEATMAP,
                     help="显示 Grad-CAM 实时热力图窗口（默认开启）")
     ap.add_argument("--no-cam", dest="cam", action="store_false",
                     help="关掉热力图，换最高帧率（热力图要跑反向传播，会抢 GPU）")
     ap.add_argument("--cam-every", type=int, default=4,
                     help="每 N 帧算一次热力图，默认 4（40fps 下约 10Hz）。"
                          "调小更流畅但更吃 GPU；控制循环本身不受影响")
+    ap.add_argument("--cam-on-change", dest="cam_on_change", action="store_true",
+                    default=False,
+                    help="只在模型判断发生变化时重算热力图（外加每 --cam-force-s 秒兜底刷新）。"
+                         "稳态下几乎不占 GPU，判帧频率基本回到不开热力图时的水平")
+    ap.add_argument("--cam-force-s", type=float, default=2.0,
+                    help="--cam-on-change 下的兜底刷新间隔（秒，默认 2）")
+    ap.add_argument("--cam-window", dest="cam_window", action="store_true",
+                    default=SHOW_WINDOW,
+                    help="弹出「画面 + 热力图 + 状态文字」窗口。默认不弹（省 CPU，"
+                         "控制台每秒仍会打印预测/帧龄/速度）")
     ap.add_argument("--no-cam-window", dest="cam_window", action="store_false",
-                    default=True, help="不弹热力图窗口，但仍然录制视频")
+                    help="不弹窗口（默认行为，写出来只是图个显式）")
     ap.add_argument("--video", default=None,
                     help="录像输出路径；不填自动生成 play_<时间>.mp4（放在 gamer_ai/ 下）")
     # 录像默认**关闭**：只想要实时热力图的话，不会在后台白白写几十 MB 的文件。

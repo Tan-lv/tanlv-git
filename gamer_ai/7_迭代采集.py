@@ -79,7 +79,7 @@ import torch.nn.functional as F
 from core.capture import WindowCapture
 from core.config import Config, key_for_label
 from core.geometry import deploy_geometry
-from core.dataset import (build_eval_transform, flatten_frames,
+from core.dataset import (append_speed_channel, build_eval_transform, flatten_frames,
                                to_video_tensor)
 from core.hookstate import (HookStateClient, ensure_state_server, open_client,
                                 kill_state_server, STATE_LOG)
@@ -417,7 +417,11 @@ class IterCollector:
               f"正确操作兜底结算 {args.correct_settle_ms:.0f}ms）")
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = build_model(self.K, len(self.labels), pretrained=False)
+        # ★ 2026-11-05：可能带速度标量通道（3*K+1），按 meta 建，别写死
+        self.speed_input = bool(m.get("speed_input", False))
+        self.in_channels = int(m.get("in_channels") or (self.K * 3))
+        self.model = build_model(self.K, len(self.labels), pretrained=False,
+                                 in_channels=self.in_channels)
         ck = torch.load(ckpt, map_location="cpu")
         self.model.load_state_dict(ck.get("model_state_dict", ck))
         self.model = self.model.to(self.device).eval()
@@ -624,7 +628,20 @@ class IterCollector:
                 return None
             frames.append(f)
         x = to_video_tensor(np.stack(frames))
-        return flatten_frames(self.transform(x)).unsqueeze(0).to(self.device)
+        x = flatten_frames(self.transform(x))
+        if getattr(self, "speed_input", False):
+            # 与 core/dataset.py 的 speed_to_z 完全一致（整图填同一个值）
+            rec = self.ring.latest(9)
+            sp = 0.0
+            if len(rec) >= 3:
+                try:
+                    from core import speed as _spd
+                    sp, _ = _spd.speed_px_per_sec([f for _, f in rec],
+                                                  [t * 1000 for t, _ in rec], stride=1)
+                except Exception:
+                    sp = 0.0
+            x = append_speed_channel(x, sp)
+        return x.unsqueeze(0).to(self.device)
 
     # ------------------------------------------------------------------
     #  hook 判卷：只看边沿，追击期间不产生新记录

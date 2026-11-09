@@ -70,7 +70,7 @@ except Exception:
 from .attention import (AttentionProbe, cam_to_frame, colorize,  # noqa: E402
                                  draw_panel, overlay)
 from .config import Config                                        # noqa: E402
-from .dataset import (build_eval_transform, flatten_frames, load_sessions,  # noqa: E402
+from .dataset import (append_speed_channel, build_eval_transform, flatten_frames, load_sessions,  # noqa: E402
                                read_strip, select_window_indices, to_video_tensor)
 from .imgio import imwrite_u                                       # noqa: E402
 from .model import build_model                                    # noqa: E402
@@ -199,7 +199,9 @@ def run_offline(args, device):
         print("  python 5_评估.py --cam --img <会话目录>/A/A_000322.jpg")
         return 0
 
-    model = build_model(K, len(labels), pretrained=False).to(device)
+    # ★ 2026-11-05：新模型可能是 3*K+1 通道（带速度标量），按 meta 建
+    model = build_model(K, len(labels), pretrained=False,
+                        in_channels=meta.get("in_channels")).to(device)
     model.load_state_dict(torch.load(ckpt, map_location=device,
                                      weights_only=False)["model_state_dict"])
     model.eval().float()                      # 必须 float32，half 会导致反向出 NaN
@@ -274,7 +276,10 @@ def run_offline(args, device):
                 for s in batch:
                     idx = select_window_indices(s, K, cfg.input_stride,
                                                 -cfg.input_end_offset_ms)
-                    xs.append(flatten_frames(tf(to_video_tensor(read_strip(s, idx)))))
+                    _x = flatten_frames(tf(to_video_tensor(read_strip(s, idx))))
+                    if meta.get("speed_input"):
+                        _x = append_speed_channel(_x, s.get("speed_px_s"))
+                    xs.append(_x)
                     idxs.append(s)
                 p = torch.softmax(model(torch.stack(xs).to(device)).float(), dim=1).cpu().numpy()
                 for j, s in enumerate(idxs):
@@ -296,7 +301,10 @@ def run_offline(args, device):
     for lab, s in picked:
         idx = select_window_indices(s, K, cfg.input_stride, -cfg.input_end_offset_ms)
         frames = read_strip(s, idx)                      # (K, H, W, 3) RGB
-        x = flatten_frames(tf(to_video_tensor(frames))).unsqueeze(0).to(device)
+        x = flatten_frames(tf(to_video_tensor(frames)))
+        if meta.get("speed_input"):
+            x = append_speed_channel(x, s.get("speed_px_s"))
+        x = x.unsqueeze(0).to(device)
         target = n_idx[s["label"]] if args.target_true else None
         res = probe.run(x, target, ablate_frames=True)   # 离线模式多跑 K 次前向，换可解释的逐帧消融
         panel = draw_panel([f for f in frames], res, labels,
@@ -363,7 +371,8 @@ def run_live(args, device):
 
     print(f"[run] {run_dir}")
     print(f"      类别 {labels}  输入 {K} 帧  帧间隔 {step_s*1000:.1f}ms  img_size {img_size}")
-    model = build_model(K, len(labels), pretrained=False).to(device)
+    model = build_model(K, len(labels), pretrained=False,
+                        in_channels=meta.get("in_channels")).to(device)
     model.load_state_dict(torch.load(ckpt, map_location=device,
                                      weights_only=False)["model_state_dict"])
     model.eval().float()
@@ -406,7 +415,19 @@ def run_live(args, device):
                         break
                     fs.append(f)
                 if ok:
-                    x = flatten_frames(tf(to_video_tensor(np.stack(fs)))).unsqueeze(0).to(device)
+                    x = flatten_frames(tf(to_video_tensor(np.stack(fs))))
+                    if meta.get("speed_input"):
+                        _r = ring.latest(9)
+                        _sp = 0.0
+                        if len(_r) >= 3:
+                            try:
+                                from .speed import speed_px_per_sec as _sps
+                                _sp, _ = _sps([f for _t, f in _r],
+                                              [t * 1000 for t, _f in _r], stride=1)
+                            except Exception:
+                                _sp = 0.0
+                        x = append_speed_channel(x, _sp)
+                    x = x.unsqueeze(0).to(device)
                     res = probe.run(x, None)
                     last = res
             if last is None:

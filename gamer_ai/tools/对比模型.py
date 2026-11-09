@@ -91,7 +91,8 @@ def eval_run(run_dir: str, samples, idxs, device, batch: int):
     img = int(meta.get("img_size", 224))
     end_off = int(meta.get("input_end_offset_ms", 0))
     stride = int(meta.get("input_stride", 1))
-    model = build_model(K, len(labels), pretrained=False)
+    model = build_model(K, len(labels), pretrained=False,
+                        in_channels=meta.get("in_channels"))
     ck = torch.load(cp, map_location=device, weights_only=False)
     model.load_state_dict(ck["model_state_dict"])
     model.to(device).eval().float()
@@ -105,7 +106,11 @@ def eval_run(run_dir: str, samples, idxs, device, batch: int):
                 s = samples[i]
                 wi = select_window_indices(s, K, stride, -end_off)
                 frames = read_strip(s, wi)
-                xs.append(flatten_frames(tf(to_video_tensor(frames))))
+                _x = flatten_frames(tf(to_video_tensor(frames)))
+                if meta.get("speed_input"):
+                    _z = min(__import__("math").log1p(max(0.0, float(s.get("speed_px_s") or 0.0))) / 4.6, 2.0)
+                    _x = torch.cat([_x, torch.full((1, _x.shape[-2], _x.shape[-1]), _z, dtype=_x.dtype)], 0)
+                xs.append(_x)
                 ys.append(n_idx[s["label"]])
             x = torch.stack(xs).to(device)
             p = torch.softmax(model(x).float(), dim=1)
@@ -203,7 +208,8 @@ def eval_occlusion(run_dir, samples, idxs, device, batch, regions, thr):
     img = int(meta.get("img_size", 224))
     end_off = int(meta.get("input_end_offset_ms", 0))
     stride = int(meta.get("input_stride", 1))
-    model = build_model(K, len(labels), pretrained=False)
+    model = build_model(K, len(labels), pretrained=False,
+                        in_channels=meta.get("in_channels"))
     ck = torch.load(os.path.join(run_dir, "best.pt"), map_location=device, weights_only=False)
     model.load_state_dict(ck["model_state_dict"])
     model.to(device).eval().float()
@@ -215,8 +221,13 @@ def eval_occlusion(run_dir, samples, idxs, device, batch, regions, thr):
             s = samples[i]
             wi = select_window_indices(s, K, stride, -end_off)
             frames = read_strip(s, wi)
-            xs = [flatten_frames(tf(to_video_tensor(apply_mask(frames, rg))))
-                  for _, rg in regions]
+            xs = []
+            for _, rg in regions:
+                _x = flatten_frames(tf(to_video_tensor(apply_mask(frames, rg))))
+                if meta.get("speed_input"):
+                    _z = min(__import__("math").log1p(max(0.0, float(s.get("speed_px_s") or 0.0))) / 4.6, 2.0)
+                    _x = torch.cat([_x, torch.full((1, _x.shape[-2], _x.shape[-1]), _z, dtype=_x.dtype)], 0)
+                xs.append(_x)
             x = torch.stack(xs).to(device)                  # (R, C, H, W)
             p = torch.softmax(model(x).float(), dim=1).cpu().numpy()
             for q, (nm, _) in enumerate(regions):
