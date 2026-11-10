@@ -157,6 +157,10 @@ def parse_args(argv=None):
                    help="关闭从换道动画合成的 N 类负样本（默认开启）")
     p.add_argument("--no-approach-neg", action="store_true",
                    help="关闭从「障碍还远」合成的 N 类负样本（默认开启；治动作偏早）")
+    p.add_argument("--anim-gate-margin-ms", type=int, default=None,
+                   help="逐偏移判断时，N 窗口结束时刻要离下一次按键的\"决策时刻\"至少"
+                        "这么远（毫秒，默认 120）。调小 = 允许 N 窗口贴得更近（样本更多、"
+                        "但和下一个动作的边界更模糊）")
     p.add_argument("--anim-share", type=float, default=0.6,
                    help="负样本超过上限时，给「换道动画中」这一类的保底比例（默认 0.6）。"
                         "被误判成 AA/DD（换道动画里又按同一个方向）多就调高；"
@@ -505,6 +509,8 @@ def train(argv=None) -> int:
             log(f"[neg] [警告] 换道动画偏移最大 {_maxe:.0f}ms 超过采集后置窗口 "
                 f"{_post:.0f}ms（session.json 的 save_post_ms）—— 超过的偏移会被逐样本丢掉。"
                 f"建议改成 <= {int(_post)}ms，例如 100,200,300,{int(_post)}")
+    if getattr(args, "anim_gate_margin_ms", None) is not None:
+        cfg.animation_neg_gate_margin_ms = int(args.anim_gate_margin_ms)
     if getattr(args, "anim_neg_ms", None):
         # ★ 2026-11-04：不重新采集也能加密"换道动画"的覆盖密度。
         #   默认只取按键后 +200/+350ms 两个点；换道动画本身约 250~350ms，
@@ -607,9 +613,15 @@ def train(argv=None) -> int:
               for k in ("train", "val", "test")}
         log(f"[neg] 合成 N 类负样本  train {len(neg_tr)} / val {len(neg_va)} "
             f"/ test {len(neg_te)}")
-        log(f"      |- 换道动画中: 按键后 {list(cfg.animation_neg_end_ms)}ms 出发，"
-            f"要求之后安静 >= {cfg.animation_neg_min_gap_ms}ms"
-            f"  -> train {bd['train']['anim']} / val {bd['val']['anim']}")
+        if getattr(cfg, "animation_neg_per_offset_gate", True):
+            log(f"      |- 换道动画中: 按键后 {list(cfg.animation_neg_end_ms)}ms 出发，"
+                f"**逐个偏移判断**（下一次按键 > 偏移+提前量{cfg.input_end_offset_ms}ms"
+                f"+{cfg.animation_neg_gate_margin_ms}ms 才算合法）"
+                f"  -> train {bd['train']['anim']} / val {bd['val']['anim']}")
+        else:
+            log(f"      |- 换道动画中: 按键后 {list(cfg.animation_neg_end_ms)}ms 出发，"
+                f"要求之后安静 >= {cfg.animation_neg_min_gap_ms}ms（一刀切）"
+                f"  -> train {bd['train']['anim']} / val {bd['val']['anim']}")
         from .dataset import synth_neg_allowed as _sna
         _skip = sum(1 for m in samples if m["label"] != "N" and not _sna(m, cfg))
         if _skip:

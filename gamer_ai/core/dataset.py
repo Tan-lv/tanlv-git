@@ -190,10 +190,23 @@ def build_animation_negatives(all_samples: Sequence[dict], cfg: Config,
         t = m["t_anchor"]
         k = bisect.bisect_right(anchors, t + 1e-6)
         gap_ms = (anchors[k] - t) * 1000.0 if k < len(anchors) else 1e9
-        if gap_ms < getattr(cfg, "animation_neg_min_gap_ms", 700):
-            continue
-        for e in ok_ends:
-            out.append((i, float(e)))
+        if getattr(cfg, "animation_neg_per_offset_gate", True):
+            # ★ 2026-11-08（用户："W 后很快按 S，中间的 N 全被丢掉了，模型学会了立刻连按"）：
+            #   逐个偏移判断。窗口结束于 t+e；模型在 t+e 时刻要输出的是
+            #   "t+e+提前量 会发生什么"。下一次按键只要不在那个时刻附近，这个 e 就合法。
+            _lead = float(getattr(cfg, "input_end_offset_ms", 0) or 0)
+            _margin = float(getattr(cfg, "animation_neg_gate_margin_ms", 120))
+            for e in ok_ends:
+                if gap_ms < e + _lead + _margin:
+                    continue                     # 这个偏移离下一次按键太近，跳过
+                out.append((i, float(e)))
+        else:
+            # 老行为：一刀切 —— 700ms 内有按键就整个锚点放弃（正因为这个，
+            # 60% 的 W->S 连按中间一个 N 样本都没有）
+            if gap_ms < getattr(cfg, "animation_neg_min_gap_ms", 700):
+                continue
+            for e in ok_ends:
+                out.append((i, float(e)))
     return out
 
 
